@@ -1074,6 +1074,8 @@ version = "0.1.0"
 dependencies = [
  "crossterm 0.29.0",
  "ratatui",
+ "unicode-segmentation",
+ "unicode-width 0.1.14",
  "webbrowser",
 ]
 

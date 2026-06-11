@@ -12,6 +12,8 @@ use std::io::{self, IsTerminal};
 use std::process::Command;
 use std::sync::mpsc::{Receiver, TryRecvError};
 use std::time::{Duration, Instant};
+use unicode_segmentation::UnicodeSegmentation;
+use unicode_width::UnicodeWidthStr;
 
 const CURSOR_BLINK_INTERVAL: Duration = Duration::from_millis(500);
 
@@ -266,20 +268,17 @@ fn render_search(frame: &mut Frame<'_>, area: Rect, app: &AppState) {
 
     frame.render_widget(Paragraph::new(Line::from(content)).block(block), area);
 
+    let query_width = display_width(&app.query) as u16;
     let cursor_x = area
         .x
         .saturating_add(1)
-        .saturating_add(if app.query.is_empty() {
-            0
-        } else {
-            display_width(&app.query).min(area.width.saturating_sub(2) as usize) as u16
-        });
+        .saturating_add(query_width.min(area.width.saturating_sub(2)));
     let cursor_y = area.y.saturating_add(1);
     frame.set_cursor_position(Position::new(cursor_x, cursor_y));
 }
 
 fn display_width(text: &str) -> usize {
-    text.chars().count()
+    UnicodeWidthStr::width(text)
 }
 
 fn render_results(frame: &mut Frame<'_>, area: Rect, app: &AppState) {
@@ -645,7 +644,7 @@ impl AppState {
     }
 
     fn backspace(&mut self) {
-        self.query.pop();
+        self.pop_grapheme();
         self.selected = 0;
         self.scroll = 0;
         self.recompute();
@@ -656,6 +655,13 @@ impl AppState {
         self.selected = 0;
         self.scroll = 0;
         self.recompute();
+    }
+
+    fn pop_grapheme(&mut self) {
+        if let Some(grapheme) = self.query.graphemes(true).next_back() {
+            let new_len = self.query.len().saturating_sub(grapheme.len());
+            self.query.truncate(new_len);
+        }
     }
 
     fn move_up(&mut self) {
@@ -769,7 +775,7 @@ impl Drop for TerminalSession {
 
 #[cfg(test)]
 mod tests {
-    use super::{best_entry, rank_entries, Tab};
+    use super::{best_entry, display_width, rank_entries, AppState, Tab};
     use crate::models::Entry;
 
     #[test]
@@ -791,5 +797,16 @@ mod tests {
         let ranked = rank_entries(&entries, "", Tab::History);
         assert_eq!(ranked.len(), 1);
         assert_eq!(ranked[0].1, 0);
+    }
+
+    #[test]
+    fn chinese_input_uses_display_width_and_backspace_removes_whole_grapheme() {
+        assert_eq!(display_width("中文"), 4);
+        let mut app = AppState::new(Vec::new());
+        app.push_char('中');
+        app.push_char('文');
+        assert_eq!(app.query, "中文");
+        app.backspace();
+        assert_eq!(app.query, "中");
     }
 }
