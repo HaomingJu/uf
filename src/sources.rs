@@ -5,7 +5,14 @@ use std::env;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
+
+const REMOTE_CACHE_TTL: Duration = Duration::from_secs(30 * 60);
+
+struct CachedEntries {
+    saved_at: u64,
+    entries: Vec<Entry>,
+}
 
 pub fn load_entries(config: &Config) -> Vec<Entry> {
     let mut entries = Vec::new();
@@ -17,12 +24,14 @@ pub fn load_entries(config: &Config) -> Vec<Entry> {
         }
     }
     if config.include_github {
+        entries.extend(load_cached_remote_entries("github"));
         match load_github_entries(config) {
             Ok(mut rows) => entries.append(&mut rows),
             Err(err) => eprintln!("github sources: {err}"),
         }
     }
     if config.include_gitlab {
+        entries.extend(load_cached_remote_entries("gitlab"));
         match load_gitlab_entries(config) {
             Ok(mut rows) => entries.append(&mut rows),
             Err(err) => eprintln!("gitlab sources: {err}"),
@@ -49,18 +58,156 @@ pub fn load_local_browser_entries() -> Result<Vec<Entry>, String> {
     Ok(deduplicate(entries))
 }
 
+pub fn load_cached_remote_entries(source: &str) -> Vec<Entry> {
+    remote_cache_path(source)
+        .and_then(|path| fs::read_to_string(path).ok())
+        .and_then(|text| parse_cached_entries(&text).ok())
+        .map(|cached| cached.entries)
+        .unwrap_or_default()
+}
+
+pub fn remote_cache_needs_refresh(source: &str) -> bool {
+    let entries = load_cached_remote_entries(source);
+    if entries.is_empty() {
+        return true;
+    }
+    match remote_cache_age(source) {
+        Some(age) => age > REMOTE_CACHE_TTL,
+        None => true,
+    }
+}
+
+pub fn save_remote_cache(source: &str, entries: &[Entry]) -> Result<(), String> {
+    let path =
+        remote_cache_path(source).ok_or_else(|| "cache directory unavailable".to_string())?;
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)
+            .map_err(|err| format!("create cache directory {}: {err}", parent.display()))?;
+    }
+    let payload = CachedEntries {
+        saved_at: now_secs(),
+        entries: entries.to_vec(),
+    };
+    let text = format_cached_entries(&payload);
+    let temp_path = path.with_extension("tmp");
+    fs::write(&temp_path, text)
+        .map_err(|err| format!("write cache {}: {err}", temp_path.display()))?;
+    fs::rename(&temp_path, &path)
+        .map_err(|err| format!("persist cache {}: {err}", path.display()))?;
+    Ok(())
+}
+
+fn format_cached_entries(cache: &CachedEntries) -> String {
+    let mut out = String::new();
+    out.push_str("saved_at\t");
+    out.push_str(&cache.saved_at.to_string());
+    out.push('\n');
+    for entry in &cache.entries {
+        out.push_str(&escape_field(&entry.title));
+        out.push('\t');
+        out.push_str(&escape_field(&entry.url));
+        out.push('\t');
+        out.push_str(&escape_field(&entry.source));
+        out.push('\t');
+        out.push_str(&escape_field(&entry.detail));
+        out.push('\n');
+    }
+    out
+}
+
+fn parse_cached_entries(text: &str) -> Result<CachedEntries, String> {
+    let mut lines = text.lines();
+    let header = lines.next().ok_or_else(|| "empty cache".to_string())?;
+    let saved_at = header
+        .strip_prefix("saved_at\t")
+        .ok_or_else(|| "invalid cache header".to_string())?
+        .parse::<u64>()
+        .map_err(|err| format!("invalid cache timestamp: {err}"))?;
+
+    let mut entries = Vec::new();
+    for line in lines {
+        if line.trim().is_empty() {
+            continue;
+        }
+        let mut parts = line.splitn(4, '\t');
+        let title = parts
+            .next()
+            .ok_or_else(|| "invalid cache row".to_string())
+            .map(unescape_field)?;
+        let url = parts
+            .next()
+            .ok_or_else(|| "invalid cache row".to_string())
+            .map(unescape_field)?;
+        let source = parts
+            .next()
+            .ok_or_else(|| "invalid cache row".to_string())
+            .map(unescape_field)?;
+        let detail = parts.next().unwrap_or_default();
+        entries.push(Entry::new(title, url, source, unescape_field(detail)));
+    }
+
+    Ok(CachedEntries { saved_at, entries })
+}
+
+fn escape_field(value: &str) -> String {
+    let mut out = String::with_capacity(value.len());
+    for ch in value.chars() {
+        match ch {
+            '%' => out.push_str("%25"),
+            '\t' => out.push_str("%09"),
+            '\n' => out.push_str("%0A"),
+            '\r' => out.push_str("%0D"),
+            _ => out.push(ch),
+        }
+    }
+    out
+}
+
+fn unescape_field(value: &str) -> String {
+    let mut out = String::with_capacity(value.len());
+    let bytes = value.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'%' && i + 2 < bytes.len() {
+            match &bytes[i + 1..i + 3] {
+                b"25" => {
+                    out.push('%');
+                    i += 3;
+                    continue;
+                }
+                b"09" => {
+                    out.push('\t');
+                    i += 3;
+                    continue;
+                }
+                b"0A" => {
+                    out.push('\n');
+                    i += 3;
+                    continue;
+                }
+                b"0D" => {
+                    out.push('\r');
+                    i += 3;
+                    continue;
+                }
+                _ => {}
+            }
+        }
+
+        let ch = value[i..].chars().next().unwrap_or_default();
+        out.push(ch);
+        i += ch.len_utf8();
+    }
+    out
+}
+
 pub fn load_github_entries(config: &Config) -> Result<Vec<Entry>, String> {
     let mut entries = Vec::new();
     let mut page = 1usize;
 
     if let Some(token) = &config.github_token {
         loop {
-            let url = format!(
-                "{}/user/repos?per_page=100&page={}&sort=updated&affiliation=owner,collaborator,organization_member",
-                config.github_api.trim_end_matches('/'),
-                page
-            );
-            let rows = fetch_github_rows(&url, Some(token))?;
+            let rows = fetch_github_page(config, page, Some(token))?;
             if rows.is_empty() {
                 break;
             }
@@ -74,15 +221,9 @@ pub fn load_github_entries(config: &Config) -> Result<Vec<Entry>, String> {
                 break;
             }
         }
-    } else if let Some(user) = &config.github_user {
+    } else if config.github_user.is_some() {
         loop {
-            let url = format!(
-                "{}/users/{}/repos?per_page=100&page={}&sort=updated&type=owner",
-                config.github_api.trim_end_matches('/'),
-                user,
-                page
-            );
-            let rows = fetch_github_rows(&url, None)?;
+            let rows = fetch_github_page(config, page, None)?;
             if rows.is_empty() {
                 break;
             }
@@ -106,18 +247,7 @@ pub fn load_gitlab_entries(config: &Config) -> Result<Vec<Entry>, String> {
     let mut page = 1usize;
 
     loop {
-        let mut url = format!(
-            "{}/projects?simple=true&per_page=100&page={}&order_by=last_activity_at&sort=desc",
-            config.gitlab_api.trim_end_matches('/'),
-            page
-        );
-        if config.gitlab_token.is_some() {
-            url.push_str("&membership=true&min_access_level=20");
-        } else {
-            url.push_str("&visibility=public");
-        }
-
-        let rows = fetch_gitlab_rows(&url, config.gitlab_token.as_deref())?;
+        let rows = fetch_gitlab_page(config, page)?;
         if rows.is_empty() {
             break;
         }
@@ -133,6 +263,46 @@ pub fn load_gitlab_entries(config: &Config) -> Result<Vec<Entry>, String> {
     }
 
     Ok(deduplicate(entries))
+}
+
+pub fn fetch_github_page(
+    config: &Config,
+    page: usize,
+    token: Option<&str>,
+) -> Result<Vec<Entry>, String> {
+    let url = if token.is_some() {
+        format!(
+            "{}/user/repos?per_page=100&page={}&sort=updated&affiliation=owner,collaborator,organization_member",
+            config.github_api.trim_end_matches('/'),
+            page
+        )
+    } else if let Some(user) = &config.github_user {
+        format!(
+            "{}/users/{}/repos?per_page=100&page={}&sort=updated&type=owner",
+            config.github_api.trim_end_matches('/'),
+            user,
+            page
+        )
+    } else {
+        return Ok(Vec::new());
+    };
+
+    fetch_github_rows(&url, token)
+}
+
+pub fn fetch_gitlab_page(config: &Config, page: usize) -> Result<Vec<Entry>, String> {
+    let mut url = format!(
+        "{}/projects?simple=true&per_page=100&page={}&order_by=last_activity_at&sort=desc",
+        config.gitlab_api.trim_end_matches('/'),
+        page
+    );
+    if config.gitlab_token.is_some() {
+        url.push_str("&membership=true&min_access_level=20");
+    } else {
+        url.push_str("&visibility=public");
+    }
+
+    fetch_gitlab_rows(&url, config.gitlab_token.as_deref())
 }
 
 fn load_chromium_family() -> Result<Vec<Entry>, String> {
@@ -531,6 +701,27 @@ fn with_url<'a>(mut args: Vec<&'a str>, url: &'a str) -> Vec<&'a str> {
 
 fn home_dir() -> Option<PathBuf> {
     env::var_os("HOME").map(PathBuf::from)
+}
+
+fn remote_cache_path(source: &str) -> Option<PathBuf> {
+    let base = env::var_os("XDG_CACHE_HOME")
+        .map(PathBuf::from)
+        .or_else(|| home_dir().map(|home| home.join(".cache")))?;
+    Some(base.join("web-fzf").join(format!("{source}.json")))
+}
+
+fn remote_cache_age(source: &str) -> Option<Duration> {
+    let path = remote_cache_path(source)?;
+    let metadata = fs::metadata(path).ok()?;
+    let modified = metadata.modified().ok()?;
+    SystemTime::now().duration_since(modified).ok()
+}
+
+fn now_secs() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_secs())
+        .unwrap_or_default()
 }
 
 fn query_sqlite(db_path: &Path, query: &str) -> Result<String, String> {

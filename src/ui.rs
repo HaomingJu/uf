@@ -10,9 +10,15 @@ use ratatui::widgets::{Block, Borders, Clear, List, ListItem, ListState, Paragra
 use std::cmp::Ordering;
 use std::io::{self, IsTerminal};
 use std::process::Command;
+use std::sync::mpsc::{Receiver, TryRecvError};
 use std::time::Duration;
 
-pub fn run_ui(entries: Vec<Entry>) -> Result<(), String> {
+pub enum UiEvent {
+    AddEntries(Vec<Entry>),
+    Status(String),
+}
+
+pub fn run_ui(entries: Vec<Entry>, events: Receiver<UiEvent>) -> Result<(), String> {
     if !io::stdin().is_terminal() || !io::stdout().is_terminal() {
         return Err("interactive terminal required".to_string());
     }
@@ -23,6 +29,7 @@ pub fn run_ui(entries: Vec<Entry>) -> Result<(), String> {
         .map_err(|err| format!("create terminal: {err}"))?;
 
     let result = loop {
+        drain_events(&mut app, &events);
         terminal
             .draw(|frame| render(frame, &app))
             .map_err(|err| format!("draw terminal: {err}"))?;
@@ -42,6 +49,24 @@ pub fn run_ui(entries: Vec<Entry>) -> Result<(), String> {
 
     session.restore();
     result
+}
+
+fn drain_events(app: &mut AppState, events: &Receiver<UiEvent>) {
+    loop {
+        match events.try_recv() {
+            Ok(UiEvent::AddEntries(rows)) => {
+                let count = rows.len();
+                if count > 0 {
+                    app.append_entries(rows);
+                    app.message = format!("Loaded {count} new entries.");
+                }
+            }
+            Ok(UiEvent::Status(message)) => {
+                app.message = message;
+            }
+            Err(TryRecvError::Empty) | Err(TryRecvError::Disconnected) => break,
+        }
+    }
 }
 
 pub fn best_entry<'a>(entries: &'a [Entry], query: &str) -> Option<&'a Entry> {
@@ -499,6 +524,21 @@ fn rank_entries_all(entries: &[Entry], query: &str) -> Vec<(i64, usize)> {
     ranked
 }
 
+fn deduplicate_entries(entries: Vec<Entry>) -> Vec<Entry> {
+    use std::collections::HashSet;
+
+    let mut seen = HashSet::new();
+    let mut deduped = Vec::new();
+    for entry in entries {
+        let key = (entry.title.clone(), entry.url.clone(), entry.source.clone());
+        if entry.url.is_empty() || !seen.insert(key) {
+            continue;
+        }
+        deduped.push(entry);
+    }
+    deduped
+}
+
 struct AppState {
     entries: Vec<Entry>,
     visible: Vec<usize>,
@@ -621,6 +661,13 @@ impl AppState {
         self.tab = self.tab.previous();
         self.selected = 0;
         self.scroll = 0;
+        self.recompute();
+    }
+
+    fn append_entries(&mut self, rows: Vec<Entry>) {
+        let mut merged = std::mem::take(&mut self.entries);
+        merged.extend(rows);
+        self.entries = deduplicate_entries(merged);
         self.recompute();
     }
 }

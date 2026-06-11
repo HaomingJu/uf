@@ -49,6 +49,8 @@ Tabs:
 - `GitHub` shows repositories visible to the configured GitHub account or user
 - `GitLab` shows visible GitLab projects
 
+GitHub and GitLab results are cached locally under the user cache directory. The app opens immediately from cache when available and refreshes stale data in the background.
+
 If GitHub, GitLab, or a protected browser source cannot be read, the app keeps the remaining sources available instead of exiting.
 
 ## Configuration

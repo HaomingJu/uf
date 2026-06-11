@@ -9,6 +9,7 @@ This repository contains a Rust terminal search tool that launches browser URLs 
 - Keep the runtime dependency footprint small enough to remain practical for local development and execution.
 - Preserve the current `Entry { title, url, source, detail }` data model unless a broader refactor is required.
 - Keep browser history, bookmarks, GitHub, and GitLab behavior aligned with the existing CLI.
+- GitHub and GitLab should use local cache first and refresh asynchronously instead of blocking startup.
 - Prefer third-party TUI libraries when improving the interface instead of hand-drawn ANSI output.
 - Avoid introducing new build systems or packaging layers unless the task explicitly requires them.
 
