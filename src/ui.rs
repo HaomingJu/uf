@@ -139,7 +139,7 @@ fn handle_key(app: &mut AppState, key: KeyEvent) -> Result<bool, String> {
 fn render(frame: &mut Frame<'_>, app: &AppState) {
     let size = frame.area();
     let layout = Layout::vertical([
-        Constraint::Length(4),
+        Constraint::Length(2),
         Constraint::Length(3),
         Constraint::Min(6),
         Constraint::Length(2),
@@ -172,12 +172,7 @@ fn preview_enabled() -> bool {
 }
 
 fn render_header(frame: &mut Frame<'_>, area: Rect, app: &AppState) {
-    let header = Layout::vertical([
-        Constraint::Length(1),
-        Constraint::Length(1),
-        Constraint::Length(1),
-    ])
-    .split(area);
+    let header = Layout::vertical([Constraint::Length(1), Constraint::Length(1)]).split(area);
 
     let title = Line::from(vec![
         Span::styled(
@@ -235,28 +230,6 @@ fn render_header(frame: &mut Frame<'_>, area: Rect, app: &AppState) {
         .highlight_style(selected_style);
 
     frame.render_widget(tabs_widget, header[1]);
-
-    let status = Line::from(vec![
-        Span::styled(
-            app.tab.label(),
-            Style::default()
-                .fg(Color::White)
-                .add_modifier(Modifier::BOLD),
-        ),
-        Span::raw("  "),
-        Span::styled(
-            "Left/Right switch tabs",
-            Style::default().fg(Color::DarkGray),
-        ),
-    ]);
-    frame.render_widget(
-        Paragraph::new(status).block(
-            Block::default()
-                .borders(Borders::BOTTOM)
-                .border_style(Style::default().fg(Color::DarkGray)),
-        ),
-        header[2],
-    );
 }
 
 fn render_search(frame: &mut Frame<'_>, area: Rect, app: &AppState) {
@@ -502,14 +475,6 @@ impl Tab {
             Tab::History => 0,
             Tab::GitHub => 1,
             Tab::GitLab => 2,
-        }
-    }
-
-    fn label(self) -> &'static str {
-        match self {
-            Tab::History => "History",
-            Tab::GitHub => "GitHub",
-            Tab::GitLab => "GitLab",
         }
     }
 
