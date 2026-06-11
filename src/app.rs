@@ -1,13 +1,16 @@
 use crate::config::Config;
 use crate::sources::{
-    fetch_github_page, fetch_gitlab_page, load_cached_remote_entries, load_local_browser_entries,
-    remote_cache_needs_refresh, save_remote_cache,
+    browser_source_signature, fetch_github_page, fetch_gitlab_page, load_cached_remote_entries,
+    load_local_browser_entries, remote_cache_needs_refresh, save_remote_cache,
+    with_source_logs_suppressed,
 };
 use crate::ui::{run_ui, UiEvent};
 use std::env;
 use std::sync::mpsc;
 use std::thread;
 use std::time::Duration;
+
+const BROWSER_REFRESH_INTERVAL: Duration = Duration::from_secs(5);
 
 pub fn run() -> Result<(), String> {
     let config = parse_args(env::args().skip(1))?;
@@ -34,6 +37,9 @@ pub fn run() -> Result<(), String> {
     }
     if config.include_gitlab && remote_cache_needs_refresh("gitlab") {
         spawn_gitlab_refresh(config.clone(), tx.clone());
+    }
+    if config.include_browser {
+        spawn_browser_refresh(tx.clone());
     }
 
     drop(tx);
@@ -167,5 +173,43 @@ fn spawn_gitlab_refresh(config: Config, tx: mpsc::Sender<UiEvent>) {
         }
         let _ = save_remote_cache("gitlab", &all_rows);
         let _ = tx.send(UiEvent::Status("GitLab refresh complete.".to_string()));
+    });
+}
+
+fn spawn_browser_refresh(tx: mpsc::Sender<UiEvent>) {
+    thread::spawn(move || {
+        let mut last_signature = browser_source_signature();
+        loop {
+            thread::sleep(BROWSER_REFRESH_INTERVAL);
+            let Some(signature) = browser_source_signature() else {
+                continue;
+            };
+            if Some(signature) == last_signature {
+                continue;
+            }
+            last_signature = Some(signature);
+
+            let _ = tx.send(UiEvent::Status(
+                "Refreshing browser history in background...".to_string(),
+            ));
+            match with_source_logs_suppressed(load_local_browser_entries) {
+                Ok(rows) => {
+                    let sources = vec!["browser-history".to_string(), "bookmark".to_string()];
+                    let count = rows.len();
+                    let _ = tx.send(UiEvent::ReplaceSourceEntries {
+                        sources,
+                        entries: rows,
+                    });
+                    let _ = tx.send(UiEvent::Status(format!(
+                        "Browser history refreshed ({count} items)."
+                    )));
+                }
+                Err(err) => {
+                    let _ = tx.send(UiEvent::Status(format!(
+                        "Browser history refresh failed: {err}"
+                    )));
+                }
+            }
+        }
     });
 }

@@ -19,6 +19,10 @@ const CURSOR_BLINK_INTERVAL: Duration = Duration::from_millis(500);
 
 pub enum UiEvent {
     AddEntries(Vec<Entry>),
+    ReplaceSourceEntries {
+        sources: Vec<String>,
+        entries: Vec<Entry>,
+    },
     Status(String),
 }
 
@@ -79,6 +83,11 @@ fn drain_events(app: &mut AppState, events: &Receiver<UiEvent>) {
                     app.append_entries(rows);
                     app.message = format!("Loaded {count} new entries.");
                 }
+            }
+            Ok(UiEvent::ReplaceSourceEntries { sources, entries }) => {
+                let count = entries.len();
+                app.replace_entries_for_sources(&sources, entries);
+                app.message = format!("Browser data refreshed ({count} items).");
             }
             Ok(UiEvent::Status(message)) => {
                 app.message = message;
@@ -282,6 +291,28 @@ fn display_width(text: &str) -> usize {
     UnicodeWidthStr::width(text)
 }
 
+fn truncate_to_width(text: &str, max_width: usize) -> String {
+    if display_width(text) <= max_width {
+        return text.to_string();
+    }
+    if max_width <= 1 {
+        return "…".to_string();
+    }
+
+    let mut out = String::new();
+    let mut width = 0usize;
+    for grapheme in text.graphemes(true) {
+        let grapheme_width = display_width(grapheme);
+        if width + grapheme_width + 1 > max_width {
+            break;
+        }
+        out.push_str(grapheme);
+        width += grapheme_width;
+    }
+    out.push('…');
+    out
+}
+
 fn render_results(frame: &mut Frame<'_>, area: Rect, app: &AppState) {
     let block = Block::default()
         .title(Span::styled(
@@ -414,9 +445,12 @@ fn render_footer(frame: &mut Frame<'_>, area: Rect, app: &AppState) {
     } else {
         "Type=fuzzy filter  Backspace=delete  Enter=open  Esc=quit"
     };
+    let available = area.width.saturating_sub(2) as usize;
+    let message = truncate_to_width(app.message.as_str(), available);
+    let help = truncate_to_width(help, available.saturating_sub(display_width(&message) + 2));
 
     let text = Line::from(vec![
-        Span::styled(app.message.as_str(), Style::default().fg(Color::Gray)),
+        Span::styled(message, Style::default().fg(Color::Gray)),
         Span::raw("  "),
         Span::styled(help, Style::default().fg(Color::DarkGray)),
     ]);
@@ -725,6 +759,16 @@ impl AppState {
         self.entries = deduplicate_entries(merged);
         self.recompute();
     }
+
+    fn replace_entries_for_sources(&mut self, sources: &[String], rows: Vec<Entry>) {
+        let mut merged: Vec<Entry> = std::mem::take(&mut self.entries)
+            .into_iter()
+            .filter(|entry| !sources.iter().any(|source| source == &entry.source))
+            .collect();
+        merged.extend(rows);
+        self.entries = deduplicate_entries(merged);
+        self.recompute();
+    }
 }
 
 struct TerminalSession {
@@ -809,5 +853,23 @@ mod tests {
         assert_eq!(app.query, "中文");
         app.backspace();
         assert_eq!(app.query, "中");
+    }
+
+    #[test]
+    fn replace_entries_for_sources_updates_existing_browser_entries() {
+        let mut app = AppState::new(vec![
+            Entry::new("Old", "https://old", "browser-history", ""),
+            Entry::new("Repo", "https://github.com/me/repo", "github", ""),
+        ]);
+        app.replace_entries_for_sources(
+            &["browser-history".to_string()],
+            vec![Entry::new("New", "https://new", "browser-history", "")],
+        );
+        assert!(app.entries.iter().any(|entry| entry.url == "https://new"));
+        assert!(!app.entries.iter().any(|entry| entry.url == "https://old"));
+        assert!(app
+            .entries
+            .iter()
+            .any(|entry| entry.url == "https://github.com/me/repo"));
     }
 }

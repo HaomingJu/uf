@@ -1,11 +1,18 @@
 use crate::config::Config;
 use crate::models::Entry;
+use std::cell::Cell;
+use std::collections::hash_map::DefaultHasher;
 use std::collections::HashSet;
 use std::env;
 use std::fs;
+use std::hash::{Hash, Hasher};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
+
+thread_local! {
+    static SUPPRESS_SOURCE_LOGS: Cell<bool> = const { Cell::new(false) };
+}
 
 const REMOTE_CACHE_TTL: Duration = Duration::from_secs(30 * 60);
 
@@ -20,21 +27,21 @@ pub fn load_entries(config: &Config) -> Vec<Entry> {
     if config.include_browser {
         match load_local_browser_entries() {
             Ok(mut rows) => entries.append(&mut rows),
-            Err(err) => eprintln!("browser sources: {err}"),
+            Err(err) => source_log(format!("browser sources: {err}")),
         }
     }
     if config.include_github {
         entries.extend(load_cached_remote_entries("github"));
         match load_github_entries(config) {
             Ok(mut rows) => entries.append(&mut rows),
-            Err(err) => eprintln!("github sources: {err}"),
+            Err(err) => source_log(format!("github sources: {err}")),
         }
     }
     if config.include_gitlab {
         entries.extend(load_cached_remote_entries("gitlab"));
         match load_gitlab_entries(config) {
             Ok(mut rows) => entries.append(&mut rows),
-            Err(err) => eprintln!("gitlab sources: {err}"),
+            Err(err) => source_log(format!("gitlab sources: {err}")),
         }
     }
 
@@ -45,17 +52,59 @@ pub fn load_local_browser_entries() -> Result<Vec<Entry>, String> {
     let mut entries = Vec::new();
     match load_chromium_family() {
         Ok(mut rows) => entries.append(&mut rows),
-        Err(err) => eprintln!("chromium browser sources: {err}"),
+        Err(err) => source_log(format!("chromium browser sources: {err}")),
     }
     match load_firefox_family() {
         Ok(mut rows) => entries.append(&mut rows),
-        Err(err) => eprintln!("firefox browser sources: {err}"),
+        Err(err) => source_log(format!("firefox browser sources: {err}")),
     }
     match load_safari() {
         Ok(mut rows) => entries.append(&mut rows),
-        Err(err) => eprintln!("safari browser sources: {err}"),
+        Err(err) => source_log(format!("safari browser sources: {err}")),
     }
     Ok(deduplicate(entries))
+}
+
+pub fn with_source_logs_suppressed<F, T>(f: F) -> T
+where
+    F: FnOnce() -> T,
+{
+    SUPPRESS_SOURCE_LOGS.with(|flag| {
+        let previous = flag.replace(true);
+        let result = f();
+        flag.set(previous);
+        result
+    })
+}
+
+pub fn browser_source_signature() -> Option<u64> {
+    let mut hasher = DefaultHasher::new();
+    let mut seen = false;
+
+    for path in chromium_history_paths()
+        .into_iter()
+        .chain(chromium_bookmark_paths())
+        .chain(firefox_place_paths())
+        .chain(safari_paths())
+    {
+        if let Ok(meta) = fs::metadata(&path) {
+            seen = true;
+            path.to_string_lossy().hash(&mut hasher);
+            meta.len().hash(&mut hasher);
+            if let Ok(modified) = meta.modified() {
+                if let Ok(duration) = modified.duration_since(UNIX_EPOCH) {
+                    duration.as_secs().hash(&mut hasher);
+                    duration.subsec_nanos().hash(&mut hasher);
+                }
+            }
+        }
+    }
+
+    if seen {
+        Some(hasher.finish())
+    } else {
+        None
+    }
 }
 
 pub fn load_cached_remote_entries(source: &str) -> Vec<Entry> {
@@ -318,13 +367,13 @@ fn load_chromium_family() -> Result<Vec<Entry>, String> {
                 .unwrap_or("Chromium"),
         ) {
             Ok(mut rows) => entries.append(&mut rows),
-            Err(err) => eprintln!("chromium history {}: {err}", path.display()),
+            Err(err) => source_log(format!("chromium history {}: {err}", path.display())),
         }
     }
     for path in chromium_bookmark_paths() {
         match load_chromium_bookmarks(&path) {
             Ok(mut rows) => entries.append(&mut rows),
-            Err(err) => eprintln!("chromium bookmarks {}: {err}", path.display()),
+            Err(err) => source_log(format!("chromium bookmarks {}: {err}", path.display())),
         }
     }
     Ok(entries)
@@ -345,7 +394,7 @@ fn load_firefox_family() -> Result<Vec<Entry>, String> {
             profile.file_name().and_then(|n| n.to_str()).unwrap_or("Firefox"),
         ) {
             Ok(mut rows) => entries.append(&mut rows),
-            Err(err) => eprintln!("firefox history {}: {err}", db.display()),
+            Err(err) => source_log(format!("firefox history {}: {err}", db.display())),
         }
 
         match load_sqlite_history(
@@ -355,7 +404,7 @@ fn load_firefox_family() -> Result<Vec<Entry>, String> {
             profile.file_name().and_then(|n| n.to_str()).unwrap_or("Firefox"),
         ) {
             Ok(mut rows) => entries.append(&mut rows),
-            Err(err) => eprintln!("firefox bookmarks {}: {err}", db.display()),
+            Err(err) => source_log(format!("firefox bookmarks {}: {err}", db.display())),
         }
     }
     Ok(entries)
@@ -371,7 +420,7 @@ fn load_safari() -> Result<Vec<Entry>, String> {
     if bookmarks.exists() {
         match load_safari_bookmarks(&bookmarks) {
             Ok(mut rows) => entries.append(&mut rows),
-            Err(err) => eprintln!("safari bookmarks {}: {err}", bookmarks.display()),
+            Err(err) => source_log(format!("safari bookmarks {}: {err}", bookmarks.display())),
         }
     }
 
@@ -384,11 +433,19 @@ fn load_safari() -> Result<Vec<Entry>, String> {
             "Safari",
         ) {
             Ok(mut rows) => entries.append(&mut rows),
-            Err(err) => eprintln!("safari history {}: {err}", history.display()),
+            Err(err) => source_log(format!("safari history {}: {err}", history.display())),
         }
     }
 
     Ok(entries)
+}
+
+fn source_log(message: String) {
+    SUPPRESS_SOURCE_LOGS.with(|flag| {
+        if !flag.get() {
+            eprintln!("{message}");
+        }
+    });
 }
 
 fn chromium_history_paths() -> Vec<PathBuf> {
@@ -426,6 +483,29 @@ fn chromium_bookmark_paths() -> Vec<PathBuf> {
             if path.exists() {
                 paths.push(path);
             }
+        }
+    }
+    paths
+}
+
+fn firefox_place_paths() -> Vec<PathBuf> {
+    firefox_profiles()
+        .into_iter()
+        .map(|profile| profile.join("places.sqlite"))
+        .filter(|path| path.exists())
+        .collect()
+}
+
+fn safari_paths() -> Vec<PathBuf> {
+    let mut paths = Vec::new();
+    if let Some(home) = home_dir() {
+        let bookmarks = home.join("Library/Safari/Bookmarks.plist");
+        if bookmarks.exists() {
+            paths.push(bookmarks);
+        }
+        let history = home.join("Library/Safari/History.db");
+        if history.exists() {
+            paths.push(history);
         }
     }
     paths
