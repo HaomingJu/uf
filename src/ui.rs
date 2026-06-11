@@ -101,7 +101,8 @@ fn handle_key(app: &mut AppState, key: KeyEvent) -> Result<bool, String> {
         KeyCode::Enter => {
             if let Some(entry) = app.selected_entry() {
                 open_entry(entry)?;
-                return Ok(true);
+                app.message = format!("Opened {}", entry.title);
+                return Ok(false);
             }
         }
         KeyCode::Backspace => {
