@@ -73,6 +73,7 @@ Environment variables:
 - `GITHUB_API`
 - `GITLAB_API`
 - `GITHUB_USER`
+- `WEB_FZF_PREVIEW` to re-enable the preview pane (`1`, `true`, `yes`, or `on`)
 
 ## Tests
 

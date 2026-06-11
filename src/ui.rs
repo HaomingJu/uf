@@ -11,7 +11,9 @@ use std::cmp::Ordering;
 use std::io::{self, IsTerminal};
 use std::process::Command;
 use std::sync::mpsc::{Receiver, TryRecvError};
-use std::time::Duration;
+use std::time::{Duration, Instant};
+
+const CURSOR_BLINK_INTERVAL: Duration = Duration::from_millis(500);
 
 pub enum UiEvent {
     AddEntries(Vec<Entry>),
@@ -27,12 +29,25 @@ pub fn run_ui(entries: Vec<Entry>, events: Receiver<UiEvent>) -> Result<(), Stri
     let mut app = AppState::new(entries);
     let mut terminal = Terminal::new(CrosstermBackend::new(io::stdout()))
         .map_err(|err| format!("create terminal: {err}"))?;
+    let mut last_cursor_toggle = Instant::now();
 
     let result = loop {
+        if last_cursor_toggle.elapsed() >= CURSOR_BLINK_INTERVAL {
+            app.cursor_visible = !app.cursor_visible;
+            last_cursor_toggle = Instant::now();
+        }
+
         drain_events(&mut app, &events);
         terminal
             .draw(|frame| render(frame, &app))
             .map_err(|err| format!("draw terminal: {err}"))?;
+
+        let mut stdout = io::stdout();
+        if app.cursor_visible {
+            execute!(stdout, Show).map_err(|err| format!("show cursor: {err}"))?;
+        } else {
+            execute!(stdout, Hide).map_err(|err| format!("hide cursor: {err}"))?;
+        }
 
         if event::poll(Duration::from_millis(150)).map_err(|err| format!("poll input: {err}"))? {
             match event::read().map_err(|err| format!("read input: {err}"))? {
@@ -40,6 +55,8 @@ pub fn run_ui(entries: Vec<Entry>, events: Receiver<UiEvent>) -> Result<(), Stri
                     if handle_key(&mut app, key)? {
                         break Ok(());
                     }
+                    app.cursor_visible = true;
+                    last_cursor_toggle = Instant::now();
                 }
                 Event::Resize(_, _) => {}
                 _ => {}
@@ -120,12 +137,26 @@ fn render(frame: &mut Frame<'_>, app: &AppState) {
     render_header(frame, layout[0], app);
     render_search(frame, layout[1], app);
 
-    let body = Layout::horizontal([Constraint::Percentage(62), Constraint::Percentage(38)])
-        .split(layout[2]);
-
-    render_results(frame, body[0], app);
-    render_preview(frame, body[1], app);
+    if preview_enabled() {
+        let body = Layout::horizontal([Constraint::Percentage(62), Constraint::Percentage(38)])
+            .split(layout[2]);
+        render_results(frame, body[0], app);
+        render_preview(frame, body[1], app);
+    } else {
+        render_results(frame, layout[2], app);
+    }
     render_footer(frame, layout[3], app);
+}
+
+fn preview_enabled() -> bool {
+    matches!(
+        std::env::var("WEB_FZF_PREVIEW")
+            .ok()
+            .as_deref()
+            .map(str::to_ascii_lowercase)
+            .as_deref(),
+        Some("1") | Some("true") | Some("yes") | Some("on")
+    )
 }
 
 fn render_header(frame: &mut Frame<'_>, area: Rect, app: &AppState) {
@@ -234,6 +265,21 @@ fn render_search(frame: &mut Frame<'_>, area: Rect, app: &AppState) {
     };
 
     frame.render_widget(Paragraph::new(Line::from(content)).block(block), area);
+
+    let cursor_x = area
+        .x
+        .saturating_add(1)
+        .saturating_add(if app.query.is_empty() {
+            0
+        } else {
+            display_width(&app.query).min(area.width.saturating_sub(2) as usize) as u16
+        });
+    let cursor_y = area.y.saturating_add(1);
+    frame.set_cursor_position(Position::new(cursor_x, cursor_y));
+}
+
+fn display_width(text: &str) -> usize {
+    text.chars().count()
 }
 
 fn render_results(frame: &mut Frame<'_>, area: Rect, app: &AppState) {
@@ -547,6 +593,7 @@ struct AppState {
     scroll: usize,
     message: String,
     tab: Tab,
+    cursor_visible: bool,
 }
 
 impl AppState {
@@ -559,6 +606,7 @@ impl AppState {
             scroll: 0,
             message: "Type to search.".to_string(),
             tab: Tab::History,
+            cursor_visible: true,
         };
         app.recompute();
         app
