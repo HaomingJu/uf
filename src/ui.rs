@@ -313,7 +313,9 @@ fn render_results(frame: &mut Frame<'_>, area: Rect, app: &AppState) {
         return;
     }
 
-    let visible = app.visible_rows(area.height.saturating_sub(2) as usize);
+    let height = area.height.saturating_sub(2) as usize;
+    let visible = app.visible_rows(height);
+    let selected_in_window = app.selected_in_window(height);
     let items: Vec<ListItem> = if visible.is_empty() {
         let text = if app.query.is_empty() {
             "Type to search."
@@ -352,7 +354,7 @@ fn render_results(frame: &mut Frame<'_>, area: Rect, app: &AppState) {
     };
 
     let mut state = ListState::default();
-    state.select(Some(app.selected));
+    state.select(Some(selected_in_window));
 
     let list = List::new(items)
         .block(block)
@@ -594,7 +596,6 @@ struct AppState {
     visible: Vec<usize>,
     query: String,
     selected: usize,
-    scroll: usize,
     message: String,
     tab: Tab,
     cursor_visible: bool,
@@ -607,7 +608,6 @@ impl AppState {
             visible: Vec::new(),
             query: String::new(),
             selected: 0,
-            scroll: 0,
             message: "Type to search.".to_string(),
             tab: Tab::History,
             cursor_visible: true,
@@ -623,7 +623,6 @@ impl AppState {
             .take(300)
             .collect();
         self.selected = self.selected.min(self.visible.len().saturating_sub(1));
-        self.scroll = self.scroll.min(self.visible.len().saturating_sub(1));
     }
 
     fn selected_entry(&self) -> Option<&Entry> {
@@ -636,29 +635,38 @@ impl AppState {
         if self.visible.is_empty() || height == 0 {
             return Vec::new();
         }
-        let start = self.scroll.min(self.visible.len().saturating_sub(1));
+        let preferred_start = self.selected.saturating_sub(5);
+        let max_start = self.visible.len().saturating_sub(height);
+        let start = preferred_start.min(max_start);
         let end = (start + height).min(self.visible.len());
         self.visible[start..end].to_vec()
+    }
+
+    fn selected_in_window(&self, height: usize) -> usize {
+        if self.visible.is_empty() || height == 0 {
+            return 0;
+        }
+        let preferred_start = self.selected.saturating_sub(5);
+        let max_start = self.visible.len().saturating_sub(height);
+        let start = preferred_start.min(max_start);
+        self.selected.saturating_sub(start)
     }
 
     fn push_char(&mut self, ch: char) {
         self.query.push(ch);
         self.selected = 0;
-        self.scroll = 0;
         self.recompute();
     }
 
     fn backspace(&mut self) {
         self.pop_grapheme();
         self.selected = 0;
-        self.scroll = 0;
         self.recompute();
     }
 
     fn clear_query(&mut self) {
         self.query.clear();
         self.selected = 0;
-        self.scroll = 0;
         self.recompute();
     }
 
@@ -673,19 +681,16 @@ impl AppState {
         if self.selected > 0 {
             self.selected -= 1;
         }
-        self.scroll = self.selected.saturating_sub(5);
     }
 
     fn move_down(&mut self) {
         if self.selected + 1 < self.visible.len() {
             self.selected += 1;
         }
-        self.scroll = self.selected.saturating_sub(5);
     }
 
     fn page_up(&mut self) {
         self.selected = self.selected.saturating_sub(10);
-        self.scroll = self.selected.saturating_sub(5);
     }
 
     fn page_down(&mut self) {
@@ -693,12 +698,10 @@ impl AppState {
             return;
         }
         self.selected = (self.selected + 10).min(self.visible.len() - 1);
-        self.scroll = self.selected.saturating_sub(5);
     }
 
     fn jump_top(&mut self) {
         self.selected = 0;
-        self.scroll = 0;
     }
 
     fn jump_bottom(&mut self) {
@@ -706,20 +709,17 @@ impl AppState {
             return;
         }
         self.selected = self.visible.len() - 1;
-        self.scroll = self.selected.saturating_sub(5);
     }
 
     fn next_tab(&mut self) {
         self.tab = self.tab.next();
         self.selected = 0;
-        self.scroll = 0;
         self.recompute();
     }
 
     fn previous_tab(&mut self) {
         self.tab = self.tab.previous();
         self.selected = 0;
-        self.scroll = 0;
         self.recompute();
     }
 
