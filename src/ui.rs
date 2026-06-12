@@ -277,6 +277,19 @@ fn display_width(text: &str) -> usize {
     UnicodeWidthStr::width(text)
 }
 
+fn pad_or_truncate(text: &str, width: usize) -> String {
+    let w = display_width(text);
+    if w >= width {
+        truncate_to_width(text, width)
+    } else {
+        let mut s = text.to_string();
+        for _ in 0..width - w {
+            s.push(' ');
+        }
+        s
+    }
+}
+
 fn truncate_to_width(text: &str, max_width: usize) -> String {
     if display_width(text) <= max_width {
         return text.to_string();
@@ -321,6 +334,16 @@ fn render_results(frame: &mut Frame<'_>, area: Rect, app: &AppState) {
         return;
     }
 
+    // inner width minus highlight symbol "❯ " (2 chars)
+    let inner_width = area.width.saturating_sub(2 + 2) as usize;
+    let type_width = 14usize;
+    let sep = 2usize; // spaces between columns
+    let name_width = (inner_width / 2).min(40).max(10);
+    let desc_width = inner_width
+        .saturating_sub(name_width)
+        .saturating_sub(type_width)
+        .saturating_sub(sep * 2);
+
     let height = area.height.saturating_sub(2) as usize;
     let visible = app.visible_rows(height);
     let selected_in_window = app.selected_in_window(height);
@@ -336,26 +359,21 @@ fn render_results(frame: &mut Frame<'_>, area: Rect, app: &AppState) {
             .into_iter()
             .map(|idx| {
                 let entry = &app.entries[idx];
-                let mut spans = vec![
+                let name_col = pad_or_truncate(&entry.title, name_width);
+                let type_col = pad_or_truncate(&entry.source, type_width);
+                let desc_col = truncate_to_width(&entry.detail, desc_width);
+                let spans = vec![
                     Span::styled(
-                        &entry.title,
+                        name_col,
                         Style::default()
                             .fg(Color::White)
                             .add_modifier(Modifier::BOLD),
                     ),
                     Span::raw("  "),
-                    Span::styled(
-                        format!("[{}]", entry.source),
-                        Style::default().fg(source_color(&entry.source)),
-                    ),
+                    Span::styled(type_col, Style::default().fg(source_color(&entry.source))),
+                    Span::raw("  "),
+                    Span::styled(desc_col, Style::default().fg(Color::Gray)),
                 ];
-                if !entry.detail.is_empty() {
-                    spans.push(Span::raw("  "));
-                    spans.push(Span::styled(
-                        &entry.detail,
-                        Style::default().fg(Color::Gray),
-                    ));
-                }
                 ListItem::new(Line::from(spans))
             })
             .collect()
