@@ -1,5 +1,6 @@
 use crate::matchers::fuzzy_score;
 use crate::models::Entry;
+use crate::sources::{dockerhub_entry_description, dockerhub_entry_tags};
 use crossterm::cursor::{Hide, Show};
 use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyModifiers};
 use crossterm::execute;
@@ -106,10 +107,32 @@ pub fn best_entry<'a>(entries: &'a [Entry], query: &str) -> Option<&'a Entry> {
 
 fn handle_key(app: &mut AppState, key: KeyEvent) -> Result<bool, String> {
     let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+
+    match &app.mode {
+        AppMode::TagList { .. } => return handle_key_tag_list(app, key),
+        AppMode::ActionMenu { .. } => return handle_key_action_menu(app, key),
+        AppMode::Normal => {}
+    }
+
     match key.code {
         KeyCode::Esc => return Ok(true),
         KeyCode::Enter => {
             if let Some(entry) = app.selected_entry() {
+                let is_dockerhub = entry.source == "public" || entry.source == "private";
+                if is_dockerhub {
+                    let repo = entry.title.clone();
+                    let tags = dockerhub_entry_tags(entry);
+                    if tags.is_empty() {
+                        app.message = format!("No cached tags found for {repo}");
+                    } else {
+                        app.mode = AppMode::TagList {
+                            repo,
+                            tags,
+                            selected: 0,
+                        };
+                    }
+                    return Ok(false);
+                }
                 open_entry(entry)?;
                 app.message = format!("Opened {}", entry.title);
                 return Ok(false);
@@ -141,6 +164,102 @@ fn handle_key(app: &mut AppState, key: KeyEvent) -> Result<bool, String> {
     Ok(false)
 }
 
+fn handle_key_tag_list(app: &mut AppState, key: KeyEvent) -> Result<bool, String> {
+    let AppMode::TagList {
+        ref repo,
+        ref tags,
+        ref mut selected,
+    } = app.mode
+    else {
+        return Ok(false);
+    };
+    match key.code {
+        KeyCode::Esc => {
+            app.mode = AppMode::Normal;
+            app.message = "Type to search.".to_string();
+        }
+        KeyCode::Enter => {
+            let tag = tags[*selected].clone();
+            let repo = repo.clone();
+            let tags = tags.clone();
+            app.mode = AppMode::ActionMenu {
+                repo,
+                tag,
+                tags,
+                selected: 0,
+            };
+        }
+        KeyCode::Up | KeyCode::Char('k') => {
+            if *selected > 0 {
+                *selected -= 1;
+            }
+        }
+        KeyCode::Down | KeyCode::Char('j') => {
+            if *selected + 1 < tags.len() {
+                *selected += 1;
+            }
+        }
+        _ => {}
+    }
+    Ok(false)
+}
+
+const ACTION_LABELS: [&str; 2] = ["Open in browser", "Copy docker pull command"];
+
+fn handle_key_action_menu(app: &mut AppState, key: KeyEvent) -> Result<bool, String> {
+    let AppMode::ActionMenu {
+        ref repo,
+        ref tag,
+        ref tags,
+        ref mut selected,
+    } = app.mode
+    else {
+        return Ok(false);
+    };
+    match key.code {
+        KeyCode::Esc => {
+            let repo = repo.clone();
+            let tags = tags.clone();
+            app.mode = AppMode::TagList {
+                repo,
+                tags,
+                selected: 0,
+            };
+        }
+        KeyCode::Enter => {
+            let action = *selected;
+            let repo = repo.clone();
+            let tag = tag.clone();
+            app.mode = AppMode::Normal;
+            match action {
+                0 => {
+                    let url = format!("https://hub.docker.com/r/{}/tags?name={}", repo, tag);
+                    let _ = webbrowser::open(&url);
+                    app.message = format!("Opened {repo}:{tag} in browser");
+                }
+                1 => {
+                    let cmd = format!("docker pull {}:{}", repo, tag);
+                    copy_to_clipboard(&cmd);
+                    app.message = format!("Copied: {cmd}");
+                }
+                _ => {}
+            }
+        }
+        KeyCode::Up | KeyCode::Char('k') => {
+            if *selected > 0 {
+                *selected -= 1;
+            }
+        }
+        KeyCode::Down | KeyCode::Char('j') => {
+            if *selected + 1 < ACTION_LABELS.len() {
+                *selected += 1;
+            }
+        }
+        _ => {}
+    }
+    Ok(false)
+}
+
 fn render(frame: &mut Frame<'_>, app: &AppState) {
     let size = frame.area();
     let layout = Layout::vertical([
@@ -154,13 +273,33 @@ fn render(frame: &mut Frame<'_>, app: &AppState) {
     render_header(frame, layout[0], app);
     render_search(frame, layout[1], app);
 
-    if preview_enabled() {
-        let body = Layout::horizontal([Constraint::Percentage(62), Constraint::Percentage(38)])
-            .split(layout[2]);
-        render_results(frame, body[0], app);
-        render_preview(frame, body[1], app);
-    } else {
-        render_results(frame, layout[2], app);
+    match &app.mode {
+        AppMode::TagList {
+            repo,
+            tags,
+            selected,
+        } => {
+            render_tag_list(frame, layout[2], repo, tags, *selected);
+        }
+        AppMode::ActionMenu {
+            repo,
+            tag,
+            tags: _,
+            selected,
+        } => {
+            render_action_menu(frame, layout[2], repo, tag, *selected);
+        }
+        AppMode::Normal => {
+            if preview_enabled() {
+                let body =
+                    Layout::horizontal([Constraint::Percentage(62), Constraint::Percentage(38)])
+                        .split(layout[2]);
+                render_results(frame, body[0], app);
+                render_preview(frame, body[1], app);
+            } else {
+                render_results(frame, layout[2], app);
+            }
+        }
     }
     render_footer(frame, layout[3], app);
 }
@@ -220,10 +359,7 @@ fn render_header(frame: &mut Frame<'_>, area: Rect, app: &AppState) {
         ),
         tab_label(
             "DockerHub",
-            app.entries
-                .iter()
-                .filter(|e| e.source == "dockerhub")
-                .count(),
+            tab_count(&app.entries, Tab::DockerHub),
             Color::Blue,
         ),
     ];
@@ -361,7 +497,7 @@ fn render_results(frame: &mut Frame<'_>, area: Rect, app: &AppState) {
                 let entry = &app.entries[idx];
                 let name_col = pad_or_truncate(&entry.title, name_width);
                 let type_col = pad_or_truncate(&entry.source, type_width);
-                let desc_col = truncate_to_width(&entry.detail, desc_width);
+                let desc_col = truncate_to_width(entry_detail(entry), desc_width);
                 let spans = vec![
                     Span::styled(
                         name_col,
@@ -429,7 +565,7 @@ fn render_preview(frame: &mut Frame<'_>, area: Rect, app: &AppState) {
             Line::from(vec![
                 Span::styled("Detail", Style::default().fg(Color::Cyan)),
                 Span::raw(": "),
-                Span::styled(&entry.detail, Style::default().fg(Color::Gray)),
+                Span::styled(entry_detail(entry), Style::default().fg(Color::Gray)),
             ]),
         ]
     } else {
@@ -446,10 +582,16 @@ fn render_preview(frame: &mut Frame<'_>, area: Rect, app: &AppState) {
 }
 
 fn render_footer(frame: &mut Frame<'_>, area: Rect, app: &AppState) {
-    let help = if app.query.is_empty() {
-        "Enter=open  Esc=quit  Up/Down=move  PageUp/PageDown=page"
-    } else {
-        "Type=fuzzy filter  Backspace=delete  Enter=open  Esc=quit"
+    let help = match &app.mode {
+        AppMode::TagList { .. } => "Up/Down=move  Enter=select tag  Esc=back",
+        AppMode::ActionMenu { .. } => "Up/Down=move  Enter=confirm  Esc=back to tags",
+        AppMode::Normal => {
+            if app.query.is_empty() {
+                "Enter=open  Esc=quit  Up/Down=move  PageUp/PageDown=page"
+            } else {
+                "Type=fuzzy filter  Backspace=delete  Enter=open  Esc=quit"
+            }
+        }
     };
     let available = area.width.saturating_sub(2) as usize;
     let message = truncate_to_width(app.message.as_str(), available);
@@ -471,18 +613,109 @@ fn render_footer(frame: &mut Frame<'_>, area: Rect, app: &AppState) {
     );
 }
 
+fn render_tag_list(
+    frame: &mut Frame<'_>,
+    area: Rect,
+    repo: &str,
+    tags: &[String],
+    selected: usize,
+) {
+    let block = Block::default()
+        .title(Span::styled(
+            format!(" Tags: {repo} "),
+            Style::default()
+                .fg(Color::Cyan)
+                .add_modifier(Modifier::BOLD),
+        ))
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(Color::Cyan));
+
+    let height = area.height.saturating_sub(2) as usize;
+    let start = selected
+        .saturating_sub(5)
+        .min(tags.len().saturating_sub(height));
+    let end = (start + height).min(tags.len());
+    let selected_in_window = selected.saturating_sub(start);
+
+    let items: Vec<ListItem> = tags[start..end]
+        .iter()
+        .map(|tag| {
+            ListItem::new(Span::styled(
+                tag.as_str(),
+                Style::default().fg(Color::White),
+            ))
+        })
+        .collect();
+
+    let mut state = ListState::default();
+    state.select(Some(selected_in_window));
+
+    let list = List::new(items)
+        .block(block)
+        .highlight_style(
+            Style::default()
+                .fg(Color::Black)
+                .bg(Color::Cyan)
+                .add_modifier(Modifier::BOLD),
+        )
+        .highlight_symbol("❯ ");
+
+    frame.render_stateful_widget(list, area, &mut state);
+}
+
+fn render_action_menu(frame: &mut Frame<'_>, area: Rect, repo: &str, tag: &str, selected: usize) {
+    let block = Block::default()
+        .title(Span::styled(
+            format!(" Action: {repo}:{tag} "),
+            Style::default()
+                .fg(Color::Cyan)
+                .add_modifier(Modifier::BOLD),
+        ))
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(Color::Cyan));
+
+    let items: Vec<ListItem> = ACTION_LABELS
+        .iter()
+        .map(|label| ListItem::new(Span::styled(*label, Style::default().fg(Color::White))))
+        .collect();
+
+    let mut state = ListState::default();
+    state.select(Some(selected));
+
+    let list = List::new(items)
+        .block(block)
+        .highlight_style(
+            Style::default()
+                .fg(Color::Black)
+                .bg(Color::Cyan)
+                .add_modifier(Modifier::BOLD),
+        )
+        .highlight_symbol("❯ ");
+
+    frame.render_stateful_widget(list, area, &mut state);
+}
+
 fn source_color(source: &str) -> Color {
     match source {
         "github" => Color::Magenta,
         "gitlab" => Color::Yellow,
         "bookmark" => Color::Blue,
-        "dockerhub" => Color::Cyan,
+        "public" => Color::Cyan,
+        "private" => Color::Red,
         _ => Color::Green,
     }
 }
 
 fn is_browser_entry(entry: &Entry) -> bool {
     entry.source == "browser-history" || entry.source == "bookmark"
+}
+
+fn entry_detail(entry: &Entry) -> &str {
+    if entry.source == "public" || entry.source == "private" {
+        dockerhub_entry_description(entry)
+    } else {
+        &entry.detail
+    }
 }
 
 fn tab_label(name: &str, count: usize, color: Color) -> Line<'static> {
@@ -494,6 +727,10 @@ fn tab_label(name: &str, count: usize, color: Color) -> Line<'static> {
         Span::raw(" "),
         Span::styled(format!("({count})"), Style::default().fg(Color::DarkGray)),
     ])
+}
+
+fn tab_count(entries: &[Entry], tab: Tab) -> usize {
+    entries.iter().filter(|entry| tab.matches(entry)).count()
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -537,7 +774,7 @@ impl Tab {
             Tab::History => is_browser_entry(entry),
             Tab::GitHub => entry.source == "github",
             Tab::GitLab => entry.source == "gitlab",
-            Tab::DockerHub => entry.source == "dockerhub",
+            Tab::DockerHub => entry.source == "public" || entry.source == "private",
         }
     }
 }
@@ -559,6 +796,24 @@ fn open_entry(entry: &Entry) -> Result<(), String> {
         .map_err(|err| format!("open browser: {err}"))?;
 
     Ok(())
+}
+
+fn copy_to_clipboard(text: &str) {
+    let command = if cfg!(target_os = "macos") {
+        "pbcopy"
+    } else {
+        "xclip"
+    };
+    let mut child = Command::new(command)
+        .stdin(std::process::Stdio::piped())
+        .spawn();
+    if let Ok(ref mut c) = child {
+        if let Some(mut stdin) = c.stdin.take() {
+            use std::io::Write;
+            let _ = stdin.write_all(text.as_bytes());
+        }
+        let _ = c.wait();
+    }
 }
 
 fn rank_entries(entries: &[Entry], query: &str, tab: Tab) -> Vec<(i64, usize)> {
@@ -631,6 +886,22 @@ struct AppState {
     message: String,
     tab: Tab,
     cursor_visible: bool,
+    mode: AppMode,
+}
+
+enum AppMode {
+    Normal,
+    TagList {
+        repo: String,
+        tags: Vec<String>,
+        selected: usize,
+    },
+    ActionMenu {
+        repo: String,
+        tag: String,
+        tags: Vec<String>,
+        selected: usize,
+    },
 }
 
 impl AppState {
@@ -643,6 +914,7 @@ impl AppState {
             message: "Type to search.".to_string(),
             tab: Tab::History,
             cursor_visible: true,
+            mode: AppMode::Normal,
         };
         app.recompute();
         app
@@ -822,7 +1094,7 @@ impl Drop for TerminalSession {
 
 #[cfg(test)]
 mod tests {
-    use super::{best_entry, display_width, rank_entries, AppState, Tab};
+    use super::{best_entry, display_width, rank_entries, tab_count, AppState, Tab};
     use crate::models::Entry;
 
     #[test]
@@ -844,6 +1116,27 @@ mod tests {
         let ranked = rank_entries(&entries, "", Tab::History);
         assert_eq!(ranked.len(), 1);
         assert_eq!(ranked[0].1, 0);
+    }
+
+    #[test]
+    fn dockerhub_tab_count_includes_public_and_private_entries() {
+        let entries = vec![
+            Entry::new(
+                "me/public",
+                "https://hub.docker.com/r/me/public",
+                "public",
+                "",
+            ),
+            Entry::new(
+                "me/private",
+                "https://hub.docker.com/r/me/private",
+                "private",
+                "",
+            ),
+            Entry::new("Repo", "https://github.com/me/repo", "github", ""),
+        ];
+
+        assert_eq!(tab_count(&entries, Tab::DockerHub), 2);
     }
 
     #[test]

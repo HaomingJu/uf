@@ -15,6 +15,7 @@ thread_local! {
 }
 
 const REMOTE_CACHE_TTL: Duration = Duration::from_secs(30 * 60);
+const DOCKERHUB_TAGS_MARKER: &str = "\nWEB_FZF_TAGS\t";
 
 struct CachedEntries {
     saved_at: u64,
@@ -118,6 +119,9 @@ pub fn load_cached_remote_entries(source: &str) -> Vec<Entry> {
 pub fn remote_cache_needs_refresh(source: &str) -> bool {
     let entries = load_cached_remote_entries(source);
     if entries.is_empty() {
+        return true;
+    }
+    if source == "dockerhub" && dockerhub_cache_missing_tags(&entries) {
         return true;
     }
     match remote_cache_age(source) {
@@ -707,6 +711,128 @@ fn parse_tsv_entries(text: &str, source: &str, default_detail: &str) -> Vec<Entr
         .collect()
 }
 
+// Parses 4-column TSV output from fetch_dockerhub_page:
+// title \t url \t source(public|private) \t detail
+fn parse_dockerhub_repo_entries(text: &str) -> Vec<Entry> {
+    text.lines()
+        .filter_map(|line| {
+            let mut parts = line.splitn(4, '\t');
+            let title = parts.next()?.trim();
+            let url = parts.next()?.trim();
+            let source = parts.next().unwrap_or("public").trim();
+            let detail = parts.next().unwrap_or("").trim();
+            if url.is_empty() {
+                return None;
+            }
+            Some(Entry::new(
+                title.to_string(),
+                url.to_string(),
+                source.to_string(),
+                detail.to_string(),
+            ))
+        })
+        .collect()
+}
+
+pub fn dockerhub_entry_description(entry: &Entry) -> &str {
+    entry
+        .detail
+        .split_once(DOCKERHUB_TAGS_MARKER)
+        .map(|(description, _)| description)
+        .unwrap_or(&entry.detail)
+}
+
+pub fn dockerhub_entry_tags(entry: &Entry) -> Vec<String> {
+    entry
+        .detail
+        .split_once(DOCKERHUB_TAGS_MARKER)
+        .map(|(_, tags)| {
+            tags.split(',')
+                .map(str::trim)
+                .filter(|tag| !tag.is_empty())
+                .map(str::to_string)
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+fn is_dockerhub_entry(entry: &Entry) -> bool {
+    entry.source == "public" || entry.source == "private"
+}
+
+fn dockerhub_cache_missing_tags(entries: &[Entry]) -> bool {
+    entries
+        .iter()
+        .any(|entry| is_dockerhub_entry(entry) && dockerhub_entry_tags(entry).is_empty())
+}
+
+fn dockerhub_detail_with_tags(description: &str, tags: &[String]) -> String {
+    if tags.is_empty() {
+        description.to_string()
+    } else {
+        format!("{}{}{}", description, DOCKERHUB_TAGS_MARKER, tags.join(","))
+    }
+}
+
+fn with_dockerhub_tags(mut entry: Entry, token: Option<&str>) -> Entry {
+    let tags = fetch_dockerhub_tags(&entry.title, token).unwrap_or_default();
+    entry.detail = dockerhub_detail_with_tags(dockerhub_entry_description(&entry), &tags);
+    entry
+}
+
+pub fn fetch_dockerhub_tags(repo: &str, token: Option<&str>) -> Result<Vec<String>, String> {
+    let url = format!(
+        "https://hub.docker.com/v2/repositories/{}/tags/?page_size=100&ordering=last_updated",
+        repo
+    );
+
+    let mut args = vec!["-sSL", "-H", "Content-Type: application/json"];
+    let auth_header;
+    if let Some(t) = token {
+        auth_header = format!("Authorization: JWT {t}");
+        args.push("-H");
+        args.push(auth_header.as_str());
+    }
+
+    let output = command_output_with_stderr("curl", &with_url(args, &url))?;
+    if output.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let script = r#"
+import json, sys
+data = json.loads(sys.stdin.read() or "{}")
+for item in (data.get("results") or []):
+    name = str(item.get("name") or "").strip()
+    if name:
+        print(name)
+"#;
+    let mut command = std::process::Command::new("python3");
+    command.arg("-c").arg(script);
+    let mut child = command
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .map_err(|err| format!("failed to run python3: {err}"))?;
+    if let Some(mut stdin) = child.stdin.take() {
+        use std::io::Write;
+        stdin
+            .write_all(output.as_bytes())
+            .map_err(|err| format!("write python stdin: {err}"))?;
+    }
+    let result = child
+        .wait_with_output()
+        .map_err(|err| format!("collect python output: {err}"))?;
+
+    let tags = String::from_utf8_lossy(&result.stdout)
+        .lines()
+        .filter(|l| !l.is_empty())
+        .map(|l| l.to_string())
+        .collect();
+    Ok(tags)
+}
+
 fn deduplicate(entries: Vec<Entry>) -> Vec<Entry> {
     let mut seen = HashSet::new();
     let mut deduped = Vec::new();
@@ -919,13 +1045,11 @@ for item in results:
     name = str(item.get("name") or "").replace("\t", " ").replace("\n", " ")
     description = str(item.get("description") or "").replace("\t", " ").replace("\n", " ")
     is_private = item.get("is_private", False)
-    pull_count = item.get("pull_count", 0)
-    repo_type = "private" if is_private else "public"
+    source = "private" if is_private else "public"
     title = f"{namespace}/{name}" if namespace else name
     url = f"https://hub.docker.com/r/{namespace}/{name}" if namespace else f"https://hub.docker.com/r/{name}"
-    detail = f"[{repo_type}] pulls:{pull_count} {description}".strip()
     if title:
-        print(f"{title}\t{url}\t{detail}")
+        print(f"{title}\t{url}\t{source}\t{description}")
 "#;
 
     let mut command = std::process::Command::new("python3");
@@ -959,7 +1083,10 @@ for item in results:
     }
 
     let parsed = String::from_utf8_lossy(&result.stdout).into_owned();
-    let entries = parse_tsv_entries(&parsed, "dockerhub", "DockerHub");
+    let entries: Vec<Entry> = parse_dockerhub_repo_entries(&parsed)
+        .into_iter()
+        .map(|entry| with_dockerhub_tags(entry, config.dockerhub_token.as_deref()))
+        .collect();
 
     if config.debug {
         eprintln!("[dockerhub] page {page}: {} entries", entries.len());
@@ -970,7 +1097,10 @@ for item in results:
 
 #[cfg(test)]
 mod tests {
-    use super::{deduplicate, parse_tsv_entries};
+    use super::{
+        deduplicate, dockerhub_cache_missing_tags, dockerhub_detail_with_tags,
+        dockerhub_entry_description, dockerhub_entry_tags, parse_tsv_entries,
+    };
     use crate::models::Entry;
 
     #[test]
@@ -989,5 +1119,30 @@ mod tests {
             Entry::new("B", "https://b", "gitlab", ""),
         ];
         assert_eq!(deduplicate(entries).len(), 2);
+    }
+
+    #[test]
+    fn dockerhub_detail_stores_description_and_tags_together() {
+        let detail = dockerhub_detail_with_tags(
+            "Small base image",
+            &["latest".to_string(), "1.0".to_string()],
+        );
+        let entry = Entry::new(
+            "me/app",
+            "https://hub.docker.com/r/me/app",
+            "public",
+            detail,
+        );
+
+        assert_eq!(dockerhub_entry_description(&entry), "Small base image");
+        assert_eq!(dockerhub_entry_tags(&entry), vec!["latest", "1.0"]);
+    }
+
+    #[test]
+    fn dockerhub_cache_missing_tags_detects_old_cache_entries() {
+        let old_entry = Entry::new("me/app", "https://hub.docker.com/r/me/app", "public", "");
+        let github_entry = Entry::new("me/repo", "https://github.com/me/repo", "github", "");
+
+        assert!(dockerhub_cache_missing_tags(&[old_entry, github_entry]));
     }
 }
