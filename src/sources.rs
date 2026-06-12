@@ -733,6 +733,16 @@ fn command_output(program: &str, args: &[&str]) -> Result<String, String> {
     Ok(String::from_utf8_lossy(&output.stdout).into_owned())
 }
 
+// Like command_output but always returns stdout regardless of exit code,
+// so API error bodies are visible in debug logs instead of being silently dropped.
+fn command_output_with_stderr(program: &str, args: &[&str]) -> Result<String, String> {
+    let output = Command::new(program)
+        .args(args)
+        .output()
+        .map_err(|err| format!("failed to run {program}: {err}"))?;
+    Ok(String::from_utf8_lossy(&output.stdout).into_owned())
+}
+
 fn run_python(script: &str, args: &[String]) -> Result<String, String> {
     let mut command = Command::new("python3");
     command.arg("-c").arg(script);
@@ -832,6 +842,130 @@ fn copy_sqlite_to_temp(db_path: &Path) -> Result<PathBuf, String> {
     fs::copy(db_path, &temp_path)
         .map_err(|err| format!("copy sqlite db {}: {err}", db_path.display()))?;
     Ok(temp_path)
+}
+
+pub fn fetch_dockerhub_page(config: &Config, page: usize) -> Result<Vec<Entry>, String> {
+    let Some(username) = &config.dockerhub_username else {
+        if config.debug {
+            eprintln!("[dockerhub] skipped: DOCKERHUB_USERNAME not set");
+        }
+        return Ok(Vec::new());
+    };
+
+    let url = format!(
+        "https://hub.docker.com/v2/repositories/{}/?page_size=100&page={}&ordering=last_updated",
+        username, page
+    );
+
+    if config.debug {
+        eprintln!("[dockerhub] GET {url}");
+        eprintln!(
+            "[dockerhub] token: {}",
+            if config.dockerhub_token.is_some() {
+                "present"
+            } else {
+                "none (public repos only)"
+            }
+        );
+    }
+
+    let mut args = vec!["-sSL", "-H", "Content-Type: application/json"];
+    let auth_header;
+    if let Some(token) = &config.dockerhub_token {
+        auth_header = format!("Authorization: JWT {token}");
+        args.push("-H");
+        args.push(auth_header.as_str());
+    }
+
+    let output = command_output_with_stderr("curl", &with_url(args, &url))?;
+
+    if config.debug {
+        eprintln!("[dockerhub] curl response ({} bytes):", output.len());
+        let preview = if output.len() > 500 {
+            format!("{}... (truncated)", &output[..500])
+        } else {
+            output.clone()
+        };
+        eprintln!("{preview}");
+    }
+
+    if output.is_empty() {
+        if config.debug {
+            eprintln!(
+                "[dockerhub] curl returned empty body (possible auth error or network issue)"
+            );
+        }
+        return Ok(Vec::new());
+    }
+
+    let script = r#"
+import json
+import sys
+
+raw = sys.stdin.read()
+try:
+    data = json.loads(raw or "{}")
+except Exception as e:
+    print(f"JSON_PARSE_ERROR: {e}", file=sys.stderr)
+    sys.exit(0)
+
+if "message" in data or "detail" in data:
+    msg = data.get("message") or data.get("detail") or ""
+    print(f"API_ERROR: {msg}", file=sys.stderr)
+
+results = data.get("results") or []
+for item in results:
+    namespace = str(item.get("namespace") or "").replace("\t", " ").replace("\n", " ")
+    name = str(item.get("name") or "").replace("\t", " ").replace("\n", " ")
+    description = str(item.get("description") or "").replace("\t", " ").replace("\n", " ")
+    is_private = item.get("is_private", False)
+    pull_count = item.get("pull_count", 0)
+    repo_type = "private" if is_private else "public"
+    title = f"{namespace}/{name}" if namespace else name
+    url = f"https://hub.docker.com/r/{namespace}/{name}" if namespace else f"https://hub.docker.com/r/{name}"
+    detail = f"[{repo_type}] pulls:{pull_count} {description}".strip()
+    if title:
+        print(f"{title}\t{url}\t{detail}")
+"#;
+
+    let mut command = std::process::Command::new("python3");
+    command.arg("-c").arg(script);
+    let mut child = command
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .map_err(|err| format!("failed to run python3: {err}"))?;
+    if let Some(mut stdin) = child.stdin.take() {
+        use std::io::Write;
+        stdin
+            .write_all(output.as_bytes())
+            .map_err(|err| format!("failed to write python stdin: {err}"))?;
+    }
+    let result = child
+        .wait_with_output()
+        .map_err(|err| format!("failed to collect python output: {err}"))?;
+
+    if config.debug {
+        let stderr_out = String::from_utf8_lossy(&result.stderr);
+        if !stderr_out.trim().is_empty() {
+            eprintln!("[dockerhub] python stderr: {stderr_out}");
+        }
+        let stdout_out = String::from_utf8_lossy(&result.stdout);
+        eprintln!(
+            "[dockerhub] python parsed {} lines",
+            stdout_out.lines().count()
+        );
+    }
+
+    let parsed = String::from_utf8_lossy(&result.stdout).into_owned();
+    let entries = parse_tsv_entries(&parsed, "dockerhub", "DockerHub");
+
+    if config.debug {
+        eprintln!("[dockerhub] page {page}: {} entries", entries.len());
+    }
+
+    Ok(entries)
 }
 
 #[cfg(test)]

@@ -218,6 +218,14 @@ fn render_header(frame: &mut Frame<'_>, area: Rect, app: &AppState) {
             app.entries.iter().filter(|e| e.source == "gitlab").count(),
             Color::Yellow,
         ),
+        tab_label(
+            "DockerHub",
+            app.entries
+                .iter()
+                .filter(|e| e.source == "dockerhub")
+                .count(),
+            Color::Blue,
+        ),
     ];
 
     let selected_style = Style::default()
@@ -450,6 +458,7 @@ fn source_color(source: &str) -> Color {
         "github" => Color::Magenta,
         "gitlab" => Color::Yellow,
         "bookmark" => Color::Blue,
+        "dockerhub" => Color::Cyan,
         _ => Color::Green,
     }
 }
@@ -474,6 +483,7 @@ enum Tab {
     History,
     GitHub,
     GitLab,
+    DockerHub,
 }
 
 impl Tab {
@@ -482,6 +492,7 @@ impl Tab {
             Tab::History => 0,
             Tab::GitHub => 1,
             Tab::GitLab => 2,
+            Tab::DockerHub => 3,
         }
     }
 
@@ -489,15 +500,17 @@ impl Tab {
         match self {
             Tab::History => Tab::GitHub,
             Tab::GitHub => Tab::GitLab,
-            Tab::GitLab => Tab::History,
+            Tab::GitLab => Tab::DockerHub,
+            Tab::DockerHub => Tab::History,
         }
     }
 
     fn previous(self) -> Self {
         match self {
-            Tab::History => Tab::GitLab,
+            Tab::History => Tab::DockerHub,
             Tab::GitHub => Tab::History,
             Tab::GitLab => Tab::GitHub,
+            Tab::DockerHub => Tab::GitLab,
         }
     }
 
@@ -506,6 +519,7 @@ impl Tab {
             Tab::History => is_browser_entry(entry),
             Tab::GitHub => entry.source == "github",
             Tab::GitLab => entry.source == "gitlab",
+            Tab::DockerHub => entry.source == "dockerhub",
         }
     }
 }

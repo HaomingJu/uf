@@ -1,8 +1,8 @@
 use crate::config::Config;
 use crate::sources::{
-    browser_source_signature, fetch_github_page, fetch_gitlab_page, load_cached_remote_entries,
-    load_local_browser_entries, remote_cache_needs_refresh, save_remote_cache,
-    with_source_logs_suppressed,
+    browser_source_signature, fetch_dockerhub_page, fetch_github_page, fetch_gitlab_page,
+    load_cached_remote_entries, load_local_browser_entries, remote_cache_needs_refresh,
+    save_remote_cache, with_source_logs_suppressed,
 };
 use crate::ui::{run_ui, UiEvent};
 use std::env;
@@ -29,6 +29,9 @@ pub fn run() -> Result<(), String> {
     if config.include_gitlab {
         entries.extend(load_cached_remote_entries("gitlab"));
     }
+    if config.include_dockerhub {
+        entries.extend(load_cached_remote_entries("dockerhub"));
+    }
 
     let (tx, rx) = mpsc::channel::<UiEvent>();
 
@@ -37,6 +40,9 @@ pub fn run() -> Result<(), String> {
     }
     if config.include_gitlab && remote_cache_needs_refresh("gitlab") {
         spawn_gitlab_refresh(config.clone(), tx.clone());
+    }
+    if config.include_dockerhub && remote_cache_needs_refresh("dockerhub") {
+        spawn_dockerhub_refresh(config.clone(), tx.clone());
     }
     if config.include_browser {
         spawn_browser_refresh(tx.clone());
@@ -58,6 +64,8 @@ where
             "--no-browser" => config.include_browser = false,
             "--no-github" => config.include_github = false,
             "--no-gitlab" => config.include_gitlab = false,
+            "--no-dockerhub" => config.include_dockerhub = false,
+            "--debug" => config.debug = true,
             "--github-token" => {
                 config.github_token = iter.next();
             }
@@ -76,6 +84,12 @@ where
             }
             "--github-user" => {
                 config.github_user = iter.next();
+            }
+            "--dockerhub-token" => {
+                config.dockerhub_token = iter.next();
+            }
+            "--dockerhub-user" => {
+                config.dockerhub_username = iter.next();
             }
             "--help" | "-h" => {
                 print_help();
@@ -96,11 +110,15 @@ Options:\n\
   --no-browser\n\
   --no-github\n\
   --no-gitlab\n\
+  --no-dockerhub\n\
   --github-token <token>\n\
   --gitlab-token <token>\n\
   --github-api <url>\n\
   --gitlab-api <url>\n\
-  --github-user <user>\n"
+  --github-user <user>\n\
+  --dockerhub-token <token>\n\
+  --dockerhub-user <user>\n\
+  --debug               write diagnostic logs to stderr\n"
     );
 }
 
@@ -173,6 +191,42 @@ fn spawn_gitlab_refresh(config: Config, tx: mpsc::Sender<UiEvent>) {
         }
         let _ = save_remote_cache("gitlab", &all_rows);
         let _ = tx.send(UiEvent::Status("GitLab refresh complete.".to_string()));
+    });
+}
+
+fn spawn_dockerhub_refresh(config: Config, tx: mpsc::Sender<UiEvent>) {
+    thread::spawn(move || {
+        thread::sleep(Duration::from_millis(800));
+        let _ = tx.send(UiEvent::Status(
+            "Refreshing DockerHub in background...".to_string(),
+        ));
+        let mut page = 1usize;
+        let mut all_rows = Vec::new();
+        loop {
+            match fetch_dockerhub_page(&config, page) {
+                Ok(rows) => {
+                    if rows.is_empty() {
+                        break;
+                    }
+                    let row_count = rows.len();
+                    all_rows.extend(rows.clone());
+                    let _ = tx.send(UiEvent::AddEntries(rows));
+                    let _ = tx.send(UiEvent::Status(format!(
+                        "DockerHub refreshing... page {page} loaded ({row_count} items)."
+                    )));
+                    if row_count < 100 || page >= 20 {
+                        break;
+                    }
+                    page += 1;
+                }
+                Err(err) => {
+                    let _ = tx.send(UiEvent::Status(format!("DockerHub refresh failed: {err}")));
+                    return;
+                }
+            }
+        }
+        let _ = save_remote_cache("dockerhub", &all_rows);
+        let _ = tx.send(UiEvent::Status("DockerHub refresh complete.".to_string()));
     });
 }
 
