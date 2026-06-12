@@ -105,6 +105,7 @@ pub fn best_entry<'a>(entries: &'a [Entry], query: &str) -> Option<&'a Entry> {
 }
 
 fn handle_key(app: &mut AppState, key: KeyEvent) -> Result<bool, String> {
+    let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
     match key.code {
         KeyCode::Esc => return Ok(true),
         KeyCode::Enter => {
@@ -117,9 +118,13 @@ fn handle_key(app: &mut AppState, key: KeyEvent) -> Result<bool, String> {
         KeyCode::Backspace => {
             app.backspace();
         }
-        KeyCode::Char('u') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+        KeyCode::Char('u') if ctrl => {
             app.clear_query();
         }
+        KeyCode::Char('j') | KeyCode::Char('n') if ctrl => app.move_down(),
+        KeyCode::Char('k') | KeyCode::Char('p') if ctrl => app.move_up(),
+        KeyCode::Char('h') if ctrl => app.previous_tab(),
+        KeyCode::Char('l') if ctrl => app.next_tab(),
         KeyCode::Char(c) if key.modifiers.is_empty() || key.modifiers == KeyModifiers::SHIFT => {
             app.push_char(c);
         }
