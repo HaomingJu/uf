@@ -17,6 +17,9 @@ use unicode_segmentation::UnicodeSegmentation;
 use unicode_width::UnicodeWidthStr;
 
 const CURSOR_BLINK_INTERVAL: Duration = Duration::from_millis(500);
+const ROW_EVEN_BG: Color = Color::Rgb(8, 13, 20);
+const ROW_ODD_BG: Color = Color::Rgb(18, 24, 32);
+const SELECTED_ROW_BG: Color = Color::Rgb(53, 63, 73);
 
 pub enum UiEvent {
     AddEntries(Vec<Entry>),
@@ -493,11 +496,17 @@ fn render_results(frame: &mut Frame<'_>, area: Rect, app: &AppState) {
     } else {
         visible
             .into_iter()
-            .map(|idx| {
+            .enumerate()
+            .map(|(row, idx)| {
                 let entry = &app.entries[idx];
                 let name_col = pad_or_truncate(&entry.title, name_width);
                 let type_col = pad_or_truncate(&entry.source, type_width);
                 let desc_col = truncate_to_width(entry_detail(entry), desc_width);
+                let row_style = Style::default().bg(if row % 2 == 0 {
+                    ROW_EVEN_BG
+                } else {
+                    ROW_ODD_BG
+                });
                 let spans = vec![
                     Span::styled(
                         name_col,
@@ -510,7 +519,7 @@ fn render_results(frame: &mut Frame<'_>, area: Rect, app: &AppState) {
                     Span::raw("  "),
                     Span::styled(desc_col, Style::default().fg(Color::Gray)),
                 ];
-                ListItem::new(Line::from(spans))
+                ListItem::new(Line::from(spans)).style(row_style)
             })
             .collect()
     };
@@ -522,11 +531,11 @@ fn render_results(frame: &mut Frame<'_>, area: Rect, app: &AppState) {
         .block(block)
         .highlight_style(
             Style::default()
-                .fg(Color::Black)
-                .bg(Color::Cyan)
+                .fg(Color::White)
+                .bg(SELECTED_ROW_BG)
                 .add_modifier(Modifier::BOLD),
         )
-        .highlight_symbol("❯ ");
+        .highlight_symbol("  ");
 
     frame.render_stateful_widget(list, area, &mut state);
 }
