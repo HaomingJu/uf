@@ -1044,7 +1044,7 @@ fn render_results(frame: &mut Frame<'_>, area: Rect, app: &mut AppState) {
                 .bg(SELECTED_ROW_BG)
                 .add_modifier(Modifier::BOLD),
         )
-        .highlight_symbol("  ");
+        .highlight_symbol("❯ ");
 
     frame.render_stateful_widget(list, area, &mut state);
 }
