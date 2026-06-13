@@ -9,6 +9,7 @@ This repository contains a Rust terminal search tool that launches browser URLs 
 - Keep the runtime dependency footprint small enough to remain practical for local development and execution.
 - Preserve the current `Entry { title, url, source, detail }` data model unless a broader refactor is required.
 - Keep browser history, bookmarks, GitHub, GitLab, and DockerHub behavior aligned with the existing CLI.
+- Keep fuzzy matching backed by `nucleo-matcher`; preserve reusable matcher instances and precomputed entry haystacks on hot search paths.
 - Remote sources should use local cache first and refresh asynchronously instead of blocking startup.
 - Do not add fixed remote cache expiry. If a remote refresh fails or returns no rows, the previous local cache remains valid and usable indefinitely.
 - Refreshes should replace local UI data only after they complete successfully with non-empty results.

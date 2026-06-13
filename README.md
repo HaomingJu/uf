@@ -13,6 +13,8 @@ This implementation is in Rust and uses a third-party TUI stack for the full-scr
 - Shows results in a tabbed, full-screen terminal UI
 - Opens the selected result in the default browser
 
+Search uses `nucleo-matcher` for fuzzy matching. The UI keeps precomputed searchable text for loaded entries so each keystroke can reuse it while ranking results.
+
 ## Runtime requirements
 
 - Rust toolchain

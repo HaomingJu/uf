@@ -1,4 +1,4 @@
-use crate::matchers::fuzzy_score;
+use crate::matchers::FuzzyMatcher;
 use crate::models::Entry;
 use crate::sources::{dockerhub_entry_description, dockerhub_entry_tags};
 use crossterm::cursor::{Hide, Show};
@@ -1168,13 +1168,19 @@ fn copy_to_clipboard(text: &str) {
     }
 }
 
-fn rank_entries(entries: &[Entry], query: &str, tab: Tab) -> Vec<(i64, usize)> {
+fn rank_entries(
+    entries: &[Entry],
+    haystacks: &[String],
+    query: &str,
+    tab: Tab,
+) -> Vec<(i64, usize)> {
+    let mut matcher = FuzzyMatcher::new(query);
     let mut ranked: Vec<(i64, usize)> = entries
         .iter()
         .enumerate()
         .filter(|(_, entry)| tab.matches(entry))
         .filter_map(|(idx, entry)| {
-            fuzzy_score(query, &entry.haystack()).map(|m| {
+            matcher.score(&haystacks[idx]).map(|m| {
                 let boost = match entry.source.as_str() {
                     "github" | "gitlab" => 20,
                     "bookmark" => 10,
@@ -1193,11 +1199,21 @@ fn rank_entries(entries: &[Entry], query: &str, tab: Tab) -> Vec<(i64, usize)> {
 }
 
 fn rank_entries_all(entries: &[Entry], query: &str) -> Vec<(i64, usize)> {
+    let haystacks = entry_haystacks(entries);
+    rank_entries_all_with_haystacks(entries, &haystacks, query)
+}
+
+fn rank_entries_all_with_haystacks(
+    entries: &[Entry],
+    haystacks: &[String],
+    query: &str,
+) -> Vec<(i64, usize)> {
+    let mut matcher = FuzzyMatcher::new(query);
     let mut ranked: Vec<(i64, usize)> = entries
         .iter()
         .enumerate()
         .filter_map(|(idx, entry)| {
-            fuzzy_score(query, &entry.haystack()).map(|m| {
+            matcher.score(&haystacks[idx]).map(|m| {
                 let boost = match entry.source.as_str() {
                     "github" | "gitlab" => 20,
                     "bookmark" => 10,
@@ -1213,6 +1229,10 @@ fn rank_entries_all(entries: &[Entry], query: &str) -> Vec<(i64, usize)> {
         other => other,
     });
     ranked
+}
+
+fn entry_haystacks(entries: &[Entry]) -> Vec<String> {
+    entries.iter().map(Entry::haystack).collect()
 }
 
 fn deduplicate_entries(entries: Vec<Entry>) -> Vec<Entry> {
@@ -1232,6 +1252,7 @@ fn deduplicate_entries(entries: Vec<Entry>) -> Vec<Entry> {
 
 struct AppState {
     entries: Vec<Entry>,
+    haystacks: Vec<String>,
     visible: Vec<usize>,
     query: String,
     selected: usize,
@@ -1270,8 +1291,10 @@ impl AppMode {
 
 impl AppState {
     fn new(entries: Vec<Entry>) -> Self {
+        let haystacks = entry_haystacks(&entries);
         let mut app = Self {
             entries,
+            haystacks,
             visible: Vec::new(),
             query: String::new(),
             selected: 0,
@@ -1287,7 +1310,7 @@ impl AppState {
     }
 
     fn recompute(&mut self) {
-        self.visible = rank_entries(&self.entries, &self.query, self.tab)
+        self.visible = rank_entries(&self.entries, &self.haystacks, &self.query, self.tab)
             .into_iter()
             .map(|(_, idx)| idx)
             .take(300)
@@ -1434,6 +1457,7 @@ impl AppState {
             .collect();
         merged.extend(rows);
         self.entries = deduplicate_entries(merged);
+        self.haystacks = entry_haystacks(&self.entries);
         self.recompute();
     }
 }
@@ -1488,9 +1512,9 @@ impl Drop for TerminalSession {
 #[cfg(test)]
 mod tests {
     use super::{
-        best_entry, display_width, open_selected_entry, parse_next_input_key, rank_entries,
-        resolve_action, tab_count, Action, AppMode, AppModeKind, AppState, InputCode, InputKey,
-        Tab,
+        best_entry, display_width, entry_haystacks, open_selected_entry, parse_next_input_key,
+        rank_entries, resolve_action, tab_count, Action, AppMode, AppModeKind, AppState, InputCode,
+        InputKey, Tab,
     };
     use crate::models::Entry;
 
@@ -1510,7 +1534,8 @@ mod tests {
             Entry::new("Example", "https://example.com", "browser-history", ""),
             Entry::new("Repo", "https://github.com/me/repo", "github", ""),
         ];
-        let ranked = rank_entries(&entries, "", Tab::History);
+        let haystacks = entry_haystacks(&entries);
+        let ranked = rank_entries(&entries, &haystacks, "", Tab::History);
         assert_eq!(ranked.len(), 1);
         assert_eq!(ranked[0].1, 0);
     }

@@ -5,6 +5,7 @@ edition = "2021"
 
 [dependencies]
 crossterm = "0.29"
+nucleo-matcher = "0.3.1"
 ratatui = "0.29"
 unicode-segmentation = "1"
 unicode-width = "0.1"
