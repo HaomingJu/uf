@@ -54,6 +54,8 @@ Tabs:
 - `GitLab` shows visible GitLab projects
 - `DockerHub` shows repositories belonging to the configured DockerHub user
 
+For DockerHub results, `Enter` opens a tag picker when tags are cached. If no tags are available, it opens the action menu directly so the repository can still be opened in the browser or copied as a `docker pull` command.
+
 GitHub, GitLab, and DockerHub results are cached locally under the user cache directory. The app opens immediately from cache when available and attempts background refreshes on each source's configured interval.
 
 If any remote source or protected browser source cannot be read, the app keeps the remaining sources available instead of exiting. Remote cache data remains usable when refreshes fail.

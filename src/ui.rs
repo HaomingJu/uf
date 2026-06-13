@@ -60,7 +60,7 @@ pub fn run_ui(
 
         drain_events(&mut app, &events);
         terminal
-            .draw(|frame| render(frame, &app))
+            .draw(|frame| render(frame, &mut app))
             .map_err(|err| format!("draw terminal: {err}"))?;
 
         let mut stdout = io::stdout();
@@ -324,6 +324,8 @@ fn resolve_tag_list_action(key: InputKey) -> Option<Action> {
         InputCode::Enter => Some(Action::SelectTag),
         InputCode::Up | InputCode::Char('k') => Some(Action::MoveUp),
         InputCode::Down | InputCode::Char('j') => Some(Action::MoveDown),
+        InputCode::Char('p') if key.ctrl => Some(Action::MoveUp),
+        InputCode::Char('n') if key.ctrl => Some(Action::MoveDown),
         InputCode::PageUp => Some(Action::PageUp),
         InputCode::PageDown => Some(Action::PageDown),
         InputCode::Char('u') if key.ctrl => Some(Action::PageUp),
@@ -338,6 +340,8 @@ fn resolve_action_menu_action(key: InputKey) -> Option<Action> {
         InputCode::Enter => Some(Action::ConfirmDockerAction),
         InputCode::Up | InputCode::Char('k') => Some(Action::MoveUp),
         InputCode::Down | InputCode::Char('j') => Some(Action::MoveDown),
+        InputCode::Char('p') if key.ctrl => Some(Action::MoveUp),
+        InputCode::Char('n') if key.ctrl => Some(Action::MoveDown),
         InputCode::PageUp => Some(Action::PageUp),
         InputCode::PageDown => Some(Action::PageDown),
         InputCode::Char('u') if key.ctrl => Some(Action::PageUp),
@@ -387,7 +391,12 @@ fn open_selected_entry(app: &mut AppState) -> Result<(), String> {
             let repo = entry.title.clone();
             let tags = dockerhub_entry_tags(entry);
             if tags.is_empty() {
-                app.message = format!("No cached tags found for {repo}");
+                app.mode = AppMode::ActionMenu {
+                    repo,
+                    tag: None,
+                    tags,
+                    selected: 0,
+                };
             } else {
                 app.mode = AppMode::TagList {
                     repo,
@@ -492,7 +501,7 @@ fn select_docker_tag(app: &mut AppState) {
     let tags = tags.clone();
     app.mode = AppMode::ActionMenu {
         repo,
-        tag,
+        tag: Some(tag),
         tags,
         selected: 0,
     };
@@ -505,6 +514,12 @@ fn back_to_docker_tags(app: &mut AppState) {
     else {
         return;
     };
+
+    if tags.is_empty() {
+        app.mode = AppMode::Normal;
+        app.message = "Type to search.".to_string();
+        return;
+    }
 
     let repo = repo.clone();
     let tags = tags.clone();
@@ -534,12 +549,21 @@ fn confirm_docker_action(app: &mut AppState) {
     app.mode = AppMode::Normal;
     match action {
         0 => {
-            let url = format!("https://hub.docker.com/r/{}/tags?name={}", repo, tag);
+            let url = match &tag {
+                Some(tag) => format!("https://hub.docker.com/r/{}/tags?name={}", repo, tag),
+                None => format!("https://hub.docker.com/r/{repo}"),
+            };
             let _ = webbrowser::open(&url);
-            app.message = format!("Opened {repo}:{tag} in browser");
+            app.message = match tag {
+                Some(tag) => format!("Opened {repo}:{tag} in browser"),
+                None => format!("Opened {repo} in browser"),
+            };
         }
         1 => {
-            let cmd = format!("docker pull {}:{}", repo, tag);
+            let cmd = match tag {
+                Some(tag) => format!("docker pull {}:{}", repo, tag),
+                None => format!("docker pull {repo}"),
+            };
             copy_to_clipboard(&cmd);
             app.message = format!("Copied: {cmd}");
         }
@@ -547,7 +571,7 @@ fn confirm_docker_action(app: &mut AppState) {
     }
 }
 
-fn render(frame: &mut Frame<'_>, app: &AppState) {
+fn render(frame: &mut Frame<'_>, app: &mut AppState) {
     let size = frame.area();
     let layout = Layout::vertical([
         Constraint::Length(2),
@@ -560,23 +584,29 @@ fn render(frame: &mut Frame<'_>, app: &AppState) {
     render_header(frame, layout[0], app);
     render_search(frame, layout[1], app);
 
-    match &app.mode {
-        AppMode::TagList {
-            repo,
-            tags,
-            selected,
-        } => {
-            render_tag_list(frame, layout[2], repo, tags, *selected);
+    match app.mode.kind() {
+        AppModeKind::TagList => {
+            if let AppMode::TagList {
+                repo,
+                tags,
+                selected,
+            } = &app.mode
+            {
+                render_tag_list(frame, layout[2], repo, tags, *selected);
+            }
         }
-        AppMode::ActionMenu {
-            repo,
-            tag,
-            tags: _,
-            selected,
-        } => {
-            render_action_menu(frame, layout[2], repo, tag, *selected);
+        AppModeKind::ActionMenu => {
+            if let AppMode::ActionMenu {
+                repo,
+                tag,
+                tags: _,
+                selected,
+            } = &app.mode
+            {
+                render_action_menu(frame, layout[2], repo, tag.as_deref(), *selected);
+            }
         }
-        AppMode::Normal => {
+        AppModeKind::Normal => {
             if preview_enabled() {
                 let body =
                     Layout::horizontal([Constraint::Percentage(62), Constraint::Percentage(38)])
@@ -735,7 +765,7 @@ fn truncate_to_width(text: &str, max_width: usize) -> String {
     out
 }
 
-fn render_results(frame: &mut Frame<'_>, area: Rect, app: &AppState) {
+fn render_results(frame: &mut Frame<'_>, area: Rect, app: &mut AppState) {
     let block = Block::default()
         .title(Span::styled(
             " Results ",
@@ -768,8 +798,9 @@ fn render_results(frame: &mut Frame<'_>, area: Rect, app: &AppState) {
         .saturating_sub(sep * 2);
 
     let height = area.height.saturating_sub(2) as usize;
-    let visible = app.visible_rows(height);
-    let selected_in_window = app.selected_in_window(height);
+    app.set_result_viewport_height(height);
+    let visible = app.visible_rows();
+    let selected_in_window = app.selected_in_window();
     let items: Vec<ListItem> = if visible.is_empty() {
         let text = if app.query.is_empty() {
             "Type to search."
@@ -956,10 +987,20 @@ fn render_tag_list(
     frame.render_stateful_widget(list, area, &mut state);
 }
 
-fn render_action_menu(frame: &mut Frame<'_>, area: Rect, repo: &str, tag: &str, selected: usize) {
+fn render_action_menu(
+    frame: &mut Frame<'_>,
+    area: Rect,
+    repo: &str,
+    tag: Option<&str>,
+    selected: usize,
+) {
+    let title = match tag {
+        Some(tag) => format!(" Action: {repo}:{tag} "),
+        None => format!(" Action: {repo} "),
+    };
     let block = Block::default()
         .title(Span::styled(
-            format!(" Action: {repo}:{tag} "),
+            title,
             Style::default()
                 .fg(Color::Cyan)
                 .add_modifier(Modifier::BOLD),
@@ -1194,6 +1235,8 @@ struct AppState {
     visible: Vec<usize>,
     query: String,
     selected: usize,
+    scroll_start: usize,
+    result_viewport_height: usize,
     message: String,
     tab: Tab,
     cursor_visible: bool,
@@ -1209,7 +1252,7 @@ enum AppMode {
     },
     ActionMenu {
         repo: String,
-        tag: String,
+        tag: Option<String>,
         tags: Vec<String>,
         selected: usize,
     },
@@ -1232,6 +1275,8 @@ impl AppState {
             visible: Vec::new(),
             query: String::new(),
             selected: 0,
+            scroll_start: 0,
+            result_viewport_height: 0,
             message: "Type to search.".to_string(),
             tab: Tab::History,
             cursor_visible: true,
@@ -1248,6 +1293,8 @@ impl AppState {
             .take(300)
             .collect();
         self.selected = self.selected.min(self.visible.len().saturating_sub(1));
+        self.clamp_scroll_start();
+        self.ensure_selected_visible();
     }
 
     fn selected_entry(&self) -> Option<&Entry> {
@@ -1256,36 +1303,66 @@ impl AppState {
             .and_then(|idx| self.entries.get(*idx))
     }
 
-    fn visible_rows(&self, height: usize) -> Vec<usize> {
-        if self.visible.is_empty() || height == 0 {
+    fn set_result_viewport_height(&mut self, height: usize) {
+        self.result_viewport_height = height;
+        self.clamp_scroll_start();
+        self.ensure_selected_visible();
+    }
+
+    fn visible_rows(&self) -> Vec<usize> {
+        if self.visible.is_empty() || self.result_viewport_height == 0 {
             return Vec::new();
         }
-        let preferred_start = self.selected.saturating_sub(5);
-        let max_start = self.visible.len().saturating_sub(height);
-        let start = preferred_start.min(max_start);
-        let end = (start + height).min(self.visible.len());
+        let start = self.scroll_start.min(self.max_scroll_start());
+        let end = (start + self.result_viewport_height).min(self.visible.len());
         self.visible[start..end].to_vec()
     }
 
-    fn selected_in_window(&self, height: usize) -> usize {
-        if self.visible.is_empty() || height == 0 {
+    fn selected_in_window(&self) -> usize {
+        if self.visible.is_empty() || self.result_viewport_height == 0 {
             return 0;
         }
-        let preferred_start = self.selected.saturating_sub(5);
-        let max_start = self.visible.len().saturating_sub(height);
-        let start = preferred_start.min(max_start);
-        self.selected.saturating_sub(start)
+        self.selected.saturating_sub(self.scroll_start)
+    }
+
+    fn max_scroll_start(&self) -> usize {
+        self.visible
+            .len()
+            .saturating_sub(self.result_viewport_height)
+    }
+
+    fn clamp_scroll_start(&mut self) {
+        self.scroll_start = self.scroll_start.min(self.max_scroll_start());
+    }
+
+    fn ensure_selected_visible(&mut self) {
+        if self.visible.is_empty() || self.result_viewport_height == 0 {
+            self.scroll_start = 0;
+            return;
+        }
+
+        if self.selected < self.scroll_start {
+            self.scroll_start = self.selected;
+        } else {
+            let viewport_end = self.scroll_start + self.result_viewport_height;
+            if self.selected >= viewport_end {
+                self.scroll_start = self.selected + 1 - self.result_viewport_height;
+            }
+        }
+        self.clamp_scroll_start();
     }
 
     fn push_char(&mut self, ch: char) {
         self.query.push(ch);
         self.selected = 0;
+        self.scroll_start = 0;
         self.recompute();
     }
 
     fn backspace(&mut self) {
         self.pop_grapheme();
         self.selected = 0;
+        self.scroll_start = 0;
         self.recompute();
     }
 
@@ -1299,17 +1376,20 @@ impl AppState {
     fn move_up(&mut self) {
         if self.selected > 0 {
             self.selected -= 1;
+            self.ensure_selected_visible();
         }
     }
 
     fn move_down(&mut self) {
         if self.selected + 1 < self.visible.len() {
             self.selected += 1;
+            self.ensure_selected_visible();
         }
     }
 
     fn page_up(&mut self) {
         self.selected = self.selected.saturating_sub(10);
+        self.ensure_selected_visible();
     }
 
     fn page_down(&mut self) {
@@ -1317,10 +1397,12 @@ impl AppState {
             return;
         }
         self.selected = (self.selected + 10).min(self.visible.len() - 1);
+        self.ensure_selected_visible();
     }
 
     fn jump_top(&mut self) {
         self.selected = 0;
+        self.ensure_selected_visible();
     }
 
     fn jump_bottom(&mut self) {
@@ -1328,17 +1410,20 @@ impl AppState {
             return;
         }
         self.selected = self.visible.len() - 1;
+        self.ensure_selected_visible();
     }
 
     fn next_tab(&mut self) {
         self.tab = self.tab.next();
         self.selected = 0;
+        self.scroll_start = 0;
         self.recompute();
     }
 
     fn previous_tab(&mut self) {
         self.tab = self.tab.previous();
         self.selected = 0;
+        self.scroll_start = 0;
         self.recompute();
     }
 
@@ -1403,8 +1488,9 @@ impl Drop for TerminalSession {
 #[cfg(test)]
 mod tests {
     use super::{
-        best_entry, display_width, parse_next_input_key, rank_entries, resolve_action, tab_count,
-        Action, AppModeKind, AppState, InputCode, InputKey, Tab,
+        best_entry, display_width, open_selected_entry, parse_next_input_key, rank_entries,
+        resolve_action, tab_count, Action, AppMode, AppModeKind, AppState, InputCode, InputKey,
+        Tab,
     };
     use crate::models::Entry;
 
@@ -1448,6 +1534,79 @@ mod tests {
         ];
 
         assert_eq!(tab_count(&entries, Tab::DockerHub), 2);
+    }
+
+    #[test]
+    fn dockerhub_entry_without_tags_opens_action_menu() {
+        let mut app = AppState::new(vec![Entry::new(
+            "juhaoming/ubuntu-dev",
+            "https://hub.docker.com/r/juhaoming/ubuntu-dev",
+            "public",
+            "Ubuntu dev image",
+        )]);
+        app.tab = Tab::DockerHub;
+        app.recompute();
+
+        open_selected_entry(&mut app).unwrap();
+
+        match app.mode {
+            AppMode::ActionMenu {
+                ref repo,
+                ref tag,
+                ref tags,
+                selected,
+            } => {
+                assert_eq!(repo, "juhaoming/ubuntu-dev");
+                assert_eq!(tag, &None);
+                assert!(tags.is_empty());
+                assert_eq!(selected, 0);
+            }
+            _ => panic!("expected action menu for dockerhub entry without tags"),
+        }
+    }
+
+    #[test]
+    fn result_selection_scrolls_only_at_viewport_edges() {
+        let entries: Vec<Entry> = (0..8)
+            .map(|idx| {
+                Entry::new(
+                    format!("Item {idx}"),
+                    format!("https://example.com/{idx}"),
+                    "browser-history",
+                    "",
+                )
+            })
+            .collect();
+        let mut app = AppState::new(entries);
+        app.set_result_viewport_height(3);
+
+        assert_eq!(app.selected, 0);
+        assert_eq!(app.scroll_start, 0);
+        assert_eq!(app.selected_in_window(), 0);
+
+        app.move_down();
+        assert_eq!(app.selected_in_window(), 1);
+        assert_eq!(app.scroll_start, 0);
+
+        app.move_down();
+        assert_eq!(app.selected_in_window(), 2);
+        assert_eq!(app.scroll_start, 0);
+
+        app.move_down();
+        assert_eq!(app.selected_in_window(), 2);
+        assert_eq!(app.scroll_start, 1);
+
+        app.move_up();
+        assert_eq!(app.selected_in_window(), 1);
+        assert_eq!(app.scroll_start, 1);
+
+        app.move_up();
+        assert_eq!(app.selected_in_window(), 0);
+        assert_eq!(app.scroll_start, 1);
+
+        app.move_up();
+        assert_eq!(app.selected_in_window(), 0);
+        assert_eq!(app.scroll_start, 0);
     }
 
     #[test]
@@ -1510,6 +1669,20 @@ mod tests {
             resolve_action(AppModeKind::ActionMenu, InputKey::new(InputCode::Enter)),
             Some(Action::ConfirmDockerAction)
         );
+    }
+
+    #[test]
+    fn ctrl_n_and_ctrl_p_move_in_modal_modes() {
+        for mode in [AppModeKind::TagList, AppModeKind::ActionMenu] {
+            assert_eq!(
+                resolve_action(mode, InputKey::ctrl('n')),
+                Some(Action::MoveDown)
+            );
+            assert_eq!(
+                resolve_action(mode, InputKey::ctrl('p')),
+                Some(Action::MoveUp)
+            );
+        }
     }
 
     #[test]
