@@ -377,6 +377,10 @@ fn resolve_tag_list_action(key: InputKey) -> Option<Action> {
         InputCode::PageDown => Some(Action::PageDown),
         InputCode::Char('u') if key.ctrl => Some(Action::PageUp),
         InputCode::Char('d') if key.ctrl => Some(Action::PageDown),
+        InputCode::Left => Some(Action::PreviousTab),
+        InputCode::Right | InputCode::Tab => Some(Action::NextTab),
+        InputCode::Char('h') if key.ctrl => Some(Action::PreviousTab),
+        InputCode::Char('l') if key.ctrl => Some(Action::NextTab),
         _ => None,
     }
 }
@@ -393,6 +397,10 @@ fn resolve_action_menu_action(key: InputKey) -> Option<Action> {
         InputCode::PageDown => Some(Action::PageDown),
         InputCode::Char('u') if key.ctrl => Some(Action::PageUp),
         InputCode::Char('d') if key.ctrl => Some(Action::PageDown),
+        InputCode::Left => Some(Action::PreviousTab),
+        InputCode::Right | InputCode::Tab => Some(Action::NextTab),
+        InputCode::Char('h') if key.ctrl => Some(Action::PreviousTab),
+        InputCode::Char('l') if key.ctrl => Some(Action::NextTab),
         _ => None,
     }
 }
@@ -409,6 +417,10 @@ fn resolve_repo_menu_action(key: InputKey) -> Option<Action> {
         InputCode::PageDown => Some(Action::PageDown),
         InputCode::Char('u') if key.ctrl => Some(Action::PageUp),
         InputCode::Char('d') if key.ctrl => Some(Action::PageDown),
+        InputCode::Left => Some(Action::PreviousTab),
+        InputCode::Right | InputCode::Tab => Some(Action::NextTab),
+        InputCode::Char('h') if key.ctrl => Some(Action::PreviousTab),
+        InputCode::Char('l') if key.ctrl => Some(Action::NextTab),
         _ => None,
     }
 }
@@ -427,8 +439,14 @@ fn apply_action(
         Action::PageDown => page_selection_down(app),
         Action::JumpTop => app.jump_top(),
         Action::JumpBottom => app.jump_bottom(),
-        Action::PreviousTab => app.previous_tab(),
-        Action::NextTab => app.next_tab(),
+        Action::PreviousTab => {
+            app.mode = AppMode::Normal;
+            app.previous_tab();
+        }
+        Action::NextTab => {
+            app.mode = AppMode::Normal;
+            app.next_tab();
+        }
         Action::RefreshCurrentTab => {
             let request = app.tab.refresh_request();
             let _ = refresh_requests.send(request);
