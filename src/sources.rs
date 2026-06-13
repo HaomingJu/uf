@@ -362,7 +362,7 @@ fn load_chromium_family() -> Result<Vec<Entry>, String> {
         match load_sqlite_history(
             &path,
             "SELECT COALESCE(title, ''), url FROM urls WHERE url IS NOT NULL AND url != '' ORDER BY last_visit_time DESC LIMIT 500;",
-            "browser-history",
+            "history",
             path.parent()
                 .and_then(|parent| parent.file_name())
                 .and_then(|name| name.to_str())
@@ -392,7 +392,7 @@ fn load_firefox_family() -> Result<Vec<Entry>, String> {
         match load_sqlite_history(
             &db,
             "SELECT COALESCE(title, ''), url FROM moz_places WHERE url IS NOT NULL AND url != '' ORDER BY last_visit_date DESC LIMIT 500;",
-            "browser-history",
+            "history",
             profile.file_name().and_then(|n| n.to_str()).unwrap_or("Firefox"),
         ) {
             Ok(mut rows) => entries.append(&mut rows),
@@ -431,7 +431,7 @@ fn load_safari() -> Result<Vec<Entry>, String> {
         match load_sqlite_history(
             &history,
             "SELECT COALESCE(history_items.title, history_items.url), history_items.url FROM history_visits JOIN history_items ON history_items.id = history_visits.history_item ORDER BY history_visits.visit_time DESC LIMIT 250;",
-            "browser-history",
+            "history",
             "Safari",
         ) {
             Ok(mut rows) => entries.append(&mut rows),

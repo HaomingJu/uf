@@ -442,7 +442,11 @@ fn try_spawn_history_refresh(tx: mpsc::Sender<UiEvent>, in_progress: Arc<AtomicB
                     ));
                     return;
                 }
-                let sources = vec!["browser-history".to_string(), "bookmark".to_string()];
+                let sources = vec![
+                    "history".to_string(),
+                    "browser-history".to_string(),
+                    "bookmark".to_string(),
+                ];
                 let count = rows.len();
                 let _ = tx.send(UiEvent::ReplaceSourceEntries {
                     sources,

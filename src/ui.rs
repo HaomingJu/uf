@@ -1041,7 +1041,7 @@ fn source_color(source: &str) -> Color {
 }
 
 fn is_browser_entry(entry: &Entry) -> bool {
-    entry.source == "browser-history" || entry.source == "bookmark"
+    entry.source == "history" || entry.source == "browser-history" || entry.source == "bookmark"
 }
 
 fn entry_detail(entry: &Entry) -> &str {
@@ -1531,7 +1531,7 @@ mod tests {
     #[test]
     fn history_tab_filters_to_browser_entries() {
         let entries = vec![
-            Entry::new("Example", "https://example.com", "browser-history", ""),
+            Entry::new("Example", "https://example.com", "history", ""),
             Entry::new("Repo", "https://github.com/me/repo", "github", ""),
         ];
         let haystacks = entry_haystacks(&entries);
@@ -1597,7 +1597,7 @@ mod tests {
                 Entry::new(
                     format!("Item {idx}"),
                     format!("https://example.com/{idx}"),
-                    "browser-history",
+                    "history",
                     "",
                 )
             })
@@ -1747,12 +1747,12 @@ mod tests {
     #[test]
     fn replace_entries_for_sources_updates_existing_browser_entries() {
         let mut app = AppState::new(vec![
-            Entry::new("Old", "https://old", "browser-history", ""),
+            Entry::new("Old", "https://old", "history", ""),
             Entry::new("Repo", "https://github.com/me/repo", "github", ""),
         ]);
         app.replace_entries_for_sources(
-            &["browser-history".to_string()],
-            vec![Entry::new("New", "https://new", "browser-history", "")],
+            &["history".to_string()],
+            vec![Entry::new("New", "https://new", "history", "")],
         );
         assert!(app.entries.iter().any(|entry| entry.url == "https://new"));
         assert!(!app.entries.iter().any(|entry| entry.url == "https://old"));
@@ -1760,5 +1760,11 @@ mod tests {
             .entries
             .iter()
             .any(|entry| entry.url == "https://github.com/me/repo"));
+    }
+
+    #[test]
+    fn history_tab_still_accepts_old_browser_history_source() {
+        let entry = Entry::new("Old", "https://old", "browser-history", "");
+        assert!(Tab::History.matches(&entry));
     }
 }
