@@ -277,7 +277,6 @@ enum Action {
     PreviousTab,
     NextTab,
     RefreshCurrentTab,
-    ClearQuery,
     Backspace,
     InsertChar(char),
     BackToNormal,
@@ -299,7 +298,8 @@ fn resolve_normal_action(key: InputKey) -> Option<Action> {
         InputCode::Esc => Some(Action::Quit),
         InputCode::Enter => Some(Action::OpenSelected),
         InputCode::Backspace => Some(Action::Backspace),
-        InputCode::Char('u') if key.ctrl => Some(Action::ClearQuery),
+        InputCode::Char('u') if key.ctrl => Some(Action::PageUp),
+        InputCode::Char('d') if key.ctrl => Some(Action::PageDown),
         InputCode::Char('f') if key.ctrl => Some(Action::RefreshCurrentTab),
         InputCode::Char('j') | InputCode::Char('n') if key.ctrl => Some(Action::MoveDown),
         InputCode::Char('k') | InputCode::Char('p') if key.ctrl => Some(Action::MoveUp),
@@ -320,20 +320,28 @@ fn resolve_normal_action(key: InputKey) -> Option<Action> {
 
 fn resolve_tag_list_action(key: InputKey) -> Option<Action> {
     match key.code {
-        InputCode::Esc => Some(Action::BackToNormal),
+        InputCode::Esc | InputCode::Backspace => Some(Action::BackToNormal),
         InputCode::Enter => Some(Action::SelectTag),
         InputCode::Up | InputCode::Char('k') => Some(Action::MoveUp),
         InputCode::Down | InputCode::Char('j') => Some(Action::MoveDown),
+        InputCode::PageUp => Some(Action::PageUp),
+        InputCode::PageDown => Some(Action::PageDown),
+        InputCode::Char('u') if key.ctrl => Some(Action::PageUp),
+        InputCode::Char('d') if key.ctrl => Some(Action::PageDown),
         _ => None,
     }
 }
 
 fn resolve_action_menu_action(key: InputKey) -> Option<Action> {
     match key.code {
-        InputCode::Esc => Some(Action::BackToTags),
+        InputCode::Esc | InputCode::Backspace => Some(Action::BackToTags),
         InputCode::Enter => Some(Action::ConfirmDockerAction),
         InputCode::Up | InputCode::Char('k') => Some(Action::MoveUp),
         InputCode::Down | InputCode::Char('j') => Some(Action::MoveDown),
+        InputCode::PageUp => Some(Action::PageUp),
+        InputCode::PageDown => Some(Action::PageDown),
+        InputCode::Char('u') if key.ctrl => Some(Action::PageUp),
+        InputCode::Char('d') if key.ctrl => Some(Action::PageDown),
         _ => None,
     }
 }
@@ -348,8 +356,8 @@ fn apply_action(
         Action::OpenSelected => open_selected_entry(app)?,
         Action::MoveUp => move_selection_up(app),
         Action::MoveDown => move_selection_down(app),
-        Action::PageUp => app.page_up(),
-        Action::PageDown => app.page_down(),
+        Action::PageUp => page_selection_up(app),
+        Action::PageDown => page_selection_down(app),
         Action::JumpTop => app.jump_top(),
         Action::JumpBottom => app.jump_bottom(),
         Action::PreviousTab => app.previous_tab(),
@@ -359,7 +367,6 @@ fn apply_action(
             let _ = refresh_requests.send(request);
             app.message = format!("Requested {} refresh.", app.tab.name());
         }
-        Action::ClearQuery => app.clear_query(),
         Action::Backspace => app.backspace(),
         Action::InsertChar(ch) => app.push_char(ch),
         Action::BackToNormal => {
@@ -432,6 +439,40 @@ fn move_selection_down(app: &mut AppState) {
             if *selected + 1 < ACTION_LABELS.len() {
                 *selected += 1;
             }
+        }
+    }
+}
+
+fn page_selection_up(app: &mut AppState) {
+    match app.mode {
+        AppMode::Normal => app.page_up(),
+        AppMode::TagList {
+            ref mut selected, ..
+        }
+        | AppMode::ActionMenu {
+            ref mut selected, ..
+        } => {
+            *selected = selected.saturating_sub(10);
+        }
+    }
+}
+
+fn page_selection_down(app: &mut AppState) {
+    match app.mode {
+        AppMode::Normal => app.page_down(),
+        AppMode::TagList {
+            ref tags,
+            ref mut selected,
+            ..
+        } => {
+            if !tags.is_empty() {
+                *selected = (*selected + 10).min(tags.len() - 1);
+            }
+        }
+        AppMode::ActionMenu {
+            ref mut selected, ..
+        } => {
+            *selected = (*selected + 10).min(ACTION_LABELS.len() - 1);
         }
     }
 }
@@ -835,13 +876,13 @@ fn render_preview(frame: &mut Frame<'_>, area: Rect, app: &AppState) {
 
 fn render_footer(frame: &mut Frame<'_>, area: Rect, app: &AppState) {
     let help = match &app.mode {
-        AppMode::TagList { .. } => "Up/Down=move  Enter=select tag  Esc=back",
-        AppMode::ActionMenu { .. } => "Up/Down=move  Enter=confirm  Esc=back to tags",
+        AppMode::TagList { .. } => "Up/Down=move  Ctrl+U/D=page  Enter=select  Backspace=back",
+        AppMode::ActionMenu { .. } => "Up/Down=move  Ctrl+U/D=page  Enter=confirm  Backspace=back",
         AppMode::Normal => {
             if app.query.is_empty() {
-                "Enter=open  Ctrl+F=refresh tab  Esc=quit  Up/Down=move"
+                "Enter=open  Ctrl+U/D=page  Ctrl+F=refresh tab  Esc=quit"
             } else {
-                "Type=fuzzy filter  Ctrl+F=refresh tab  Enter=open  Esc=quit"
+                "Type=fuzzy filter  Ctrl+U/D=page  Enter=open  Esc=quit"
             }
         }
     };
@@ -1248,12 +1289,6 @@ impl AppState {
         self.recompute();
     }
 
-    fn clear_query(&mut self) {
-        self.query.clear();
-        self.selected = 0;
-        self.recompute();
-    }
-
     fn pop_grapheme(&mut self) {
         if let Some(grapheme) = self.query.graphemes(true).next_back() {
             let new_len = self.query.len().saturating_sub(grapheme.len());
@@ -1474,6 +1509,40 @@ mod tests {
         assert_eq!(
             resolve_action(AppModeKind::ActionMenu, InputKey::new(InputCode::Enter)),
             Some(Action::ConfirmDockerAction)
+        );
+    }
+
+    #[test]
+    fn ctrl_u_and_ctrl_d_page_in_all_modes() {
+        for mode in [
+            AppModeKind::Normal,
+            AppModeKind::TagList,
+            AppModeKind::ActionMenu,
+        ] {
+            assert_eq!(
+                resolve_action(mode, InputKey::ctrl('u')),
+                Some(Action::PageUp)
+            );
+            assert_eq!(
+                resolve_action(mode, InputKey::ctrl('d')),
+                Some(Action::PageDown)
+            );
+        }
+    }
+
+    #[test]
+    fn backspace_goes_back_only_in_modal_modes() {
+        assert_eq!(
+            resolve_action(AppModeKind::Normal, InputKey::new(InputCode::Backspace)),
+            Some(Action::Backspace)
+        );
+        assert_eq!(
+            resolve_action(AppModeKind::TagList, InputKey::new(InputCode::Backspace)),
+            Some(Action::BackToNormal)
+        );
+        assert_eq!(
+            resolve_action(AppModeKind::ActionMenu, InputKey::new(InputCode::Backspace)),
+            Some(Action::BackToTags)
         );
     }
 

@@ -40,10 +40,12 @@ web-fzf
 - Type to filter
 - `Up` / `Down` to move selection
 - `PageUp` / `PageDown` to jump
+- `Ctrl+U` / `Ctrl+D` to jump up or down
 - `Left` / `Right` or `Tab` to switch between tabs
 - `Ctrl+F` to refresh the current tab
 - `Enter` to open the selected URL
-- `Esc` to quit
+- `Backspace` to delete search text, or go back one level inside DockerHub tag/action views
+- `Esc` to quit from the main page, or go back from DockerHub tag/action views
 
 Tabs:
 

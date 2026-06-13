@@ -13,6 +13,7 @@ This repository contains a Rust terminal search tool that launches browser URLs 
 - Do not add fixed remote cache expiry. If a remote refresh fails or returns no rows, the previous local cache remains valid and usable indefinitely.
 - Refreshes should replace local UI data only after they complete successfully with non-empty results.
 - `Ctrl+F` requests an immediate refresh for the current tab. Do not start a duplicate refresh when that tab is already refreshing.
+- `Ctrl+U` and `Ctrl+D` page up/down in all UI modes. `Backspace` deletes search text in the main view and goes back one level inside DockerHub tag/action views; it must not exit the app.
 - Keep keyboard handling routed through the input/keymap/action layers; do not add feature behavior directly to raw input parsing.
 - Keep refresh intervals source-specific and configurable through environment variables: `WEB_FZF_HISTORY_REFRESH` defaults to `5s`; `WEB_FZF_GITHUB_REFRESH`, `WEB_FZF_GITLAB_REFRESH`, and `WEB_FZF_DOCKERHUB_REFRESH` default to `1min`.
 - Prefer third-party TUI libraries when improving the interface instead of hand-drawn ANSI output.
