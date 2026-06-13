@@ -15,26 +15,41 @@ This implementation is in Rust and uses a third-party TUI stack for the full-scr
 
 Search uses `nucleo-matcher` for fuzzy matching. The UI keeps precomputed searchable text for loaded entries so each keystroke can reuse it while ranking results.
 
+## Installation
+
+### Homebrew (macOS / Linux)
+
+```bash
+brew install HaomingJu/tap/uf
+```
+
+### One-line install script (macOS / Linux)
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/HaomingJu/uf/main/install.sh | sh
+```
+
+To install a specific version or to a custom directory:
+
+```bash
+UF_VERSION=v0.1.0 UF_INSTALL_DIR=/usr/local/bin sh install.sh
+```
+
+### Build from source
+
+Requires a Rust toolchain, `sqlite3`, `curl`, and `stty`.
+
+```bash
+cargo install --git https://github.com/HaomingJu/uf
+```
+
 ## Runtime requirements
 
-- Rust toolchain
 - `sqlite3`
 - `curl`
 - `stty`
 - On macOS, the standard `open` command
 - On Linux, `xdg-open`
-
-## Run
-
-```bash
-cargo run --release
-```
-
-Or after installation:
-
-```bash
-uf
-```
 
 ## Controls
 
