@@ -621,11 +621,15 @@ fn walk_chromium_bookmarks(node: &JsonValue, folder: &str, entries: &mut Vec<Ent
                 if url.is_empty() {
                     continue;
                 }
-                let title = clean_json_str(child.get("name")).unwrap_or_else(|| url.clone());
+                let title = clean_title(
+                    clean_json_str(child.get("name"))
+                        .as_deref()
+                        .unwrap_or(url.as_str()),
+                );
                 entries.push(Entry::new(title, url, "bookmark", folder.to_string()));
             }
             Some("folder") => {
-                let name = clean_json_str(child.get("name")).unwrap_or_default();
+                let name = clean_title(clean_json_str(child.get("name")).as_deref().unwrap_or(""));
                 let next_folder = if folder.is_empty() {
                     name
                 } else if name.is_empty() {
@@ -661,17 +665,17 @@ fn walk_safari_bookmarks(node: &PlistValue, folder: &str, entries: &mut Vec<Entr
             .or_else(|| dict.get("Title").and_then(PlistValue::as_string))
             .unwrap_or(url);
         entries.push(Entry::new(
-            clean_text(title),
+            clean_title(title),
             clean_text(url),
             "bookmark",
-            clean_text(folder),
+            clean_title(folder),
         ));
     }
 
     let title = dict
         .get("Title")
         .and_then(PlistValue::as_string)
-        .map(clean_text)
+        .map(clean_title)
         .unwrap_or_default();
     let next_folder = if title.is_empty() {
         folder.to_string()
@@ -746,11 +750,40 @@ fn clean_text(value: &str) -> String {
     value.replace(['\t', '\n', '\r'], " ")
 }
 
+fn clean_title(value: &str) -> String {
+    value
+        .trim_matches(|ch: char| ch.is_whitespace() || is_title_format_char(ch))
+        .to_string()
+}
+
+fn is_title_format_char(ch: char) -> bool {
+    matches!(
+        ch,
+        '\u{200B}'
+            | '\u{200C}'
+            | '\u{200D}'
+            | '\u{200E}'
+            | '\u{200F}'
+            | '\u{061C}'
+            | '\u{2060}'
+            | '\u{FEFF}'
+            | '\u{202A}'
+            | '\u{202B}'
+            | '\u{202C}'
+            | '\u{202D}'
+            | '\u{202E}'
+            | '\u{2066}'
+            | '\u{2067}'
+            | '\u{2068}'
+            | '\u{2069}'
+    )
+}
+
 fn parse_tsv_entries(text: &str, source: &str, default_detail: &str) -> Vec<Entry> {
     text.lines()
         .filter_map(|line| {
             let mut parts = line.splitn(3, '\t');
-            let title = parts.next()?.trim();
+            let title = clean_title(parts.next()?.trim());
             let url = parts.next()?.trim();
             let detail = parts.next().unwrap_or(default_detail).trim();
             if url.is_empty() {
@@ -1051,8 +1084,8 @@ fn parse_dockerhub_repo_entries(text: &str, debug: bool) -> Result<Vec<Entry>, S
 #[cfg(test)]
 mod tests {
     use super::{
-        deduplicate, dockerhub_detail_with_tags, dockerhub_entry_description, dockerhub_entry_tags,
-        parse_tsv_entries,
+        clean_title, deduplicate, dockerhub_detail_with_tags, dockerhub_entry_description,
+        dockerhub_entry_tags, parse_tsv_entries,
     };
     use crate::models::Entry;
 
@@ -1062,6 +1095,12 @@ mod tests {
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].url, "https://example.com");
         assert_eq!(rows[0].detail, "Detail");
+    }
+
+    #[test]
+    fn clean_title_strips_leading_whitespace_and_format_chars() {
+        let title = clean_title("\u{200F}\u{200D}   目开发代码合入记录 - 飞书云文档");
+        assert_eq!(title, "目开发代码合入记录 - 飞书云文档");
     }
 
     #[test]

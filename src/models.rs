@@ -13,8 +13,9 @@ impl Entry {
         source: impl Into<String>,
         detail: impl Into<String>,
     ) -> Self {
+        let title = title.into();
         Self {
-            title: title.into(),
+            title: normalize_title(&title),
             url: url.into(),
             source: source.into(),
             detail: detail.into(),
@@ -26,5 +27,50 @@ impl Entry {
             "{} {} {} {}",
             self.title, self.url, self.source, self.detail
         )
+    }
+}
+
+fn normalize_title(value: &str) -> String {
+    value
+        .trim_matches(|ch: char| {
+            ch.is_whitespace()
+                || matches!(
+                    ch,
+                    '\u{200B}'
+                        | '\u{200C}'
+                        | '\u{200D}'
+                        | '\u{200E}'
+                        | '\u{200F}'
+                        | '\u{061C}'
+                        | '\u{2060}'
+                        | '\u{FEFF}'
+                        | '\u{202A}'
+                        | '\u{202B}'
+                        | '\u{202C}'
+                        | '\u{202D}'
+                        | '\u{202E}'
+                        | '\u{2066}'
+                        | '\u{2067}'
+                        | '\u{2068}'
+                        | '\u{2069}'
+                )
+        })
+        .to_string()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::Entry;
+
+    #[test]
+    fn entry_new_strips_leading_whitespace_and_format_chars_from_title() {
+        let entry = Entry::new(
+            "\u{200f}\u{200d}   目开发代码合入记录 - 飞书云文档",
+            "https://example.com",
+            "bookmark",
+            "",
+        );
+
+        assert_eq!(entry.title, "目开发代码合入记录 - 飞书云文档");
     }
 }

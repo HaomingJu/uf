@@ -9,6 +9,7 @@ This repository contains a Rust terminal search tool that launches browser URLs 
 - Keep the runtime dependency footprint small enough to remain practical for local development and execution.
 - Preserve the current `Entry { title, url, source, detail }` data model unless a broader refactor is required.
 - Keep browser history, bookmarks, GitHub, GitLab, and DockerHub behavior aligned with the existing CLI.
+- GitHub, GitLab, and DockerHub results should omit descriptions from the list, keep detail text in the preview pane, and use a secondary menu for `Open in browser` / `Copy repository address`.
 - Do not add `python3` or other script runtime dependencies for source parsing; prefer Rust crates such as `serde_json` and `plist`.
 - Keep fuzzy matching backed by `nucleo-matcher`; preserve reusable matcher instances and precomputed entry haystacks on hot search paths.
 - Remote sources should use local cache first and refresh asynchronously instead of blocking startup.
@@ -17,6 +18,7 @@ This repository contains a Rust terminal search tool that launches browser URLs 
 - `Ctrl+F` requests an immediate refresh for the current tab. Do not start a duplicate refresh when that tab is already refreshing.
 - `Ctrl+U` and `Ctrl+D` page up/down in all UI modes. `Backspace` deletes search text in the main view and goes back one level inside DockerHub tag/action views; it must not exit the app.
 - Keep keyboard handling routed through the input/keymap/action layers; do not add feature behavior directly to raw input parsing.
+- When adding new source-specific menus, keep them behind explicit app modes and preserve preview rendering for the selected entry when the UI expects detail context.
 - Keep refresh intervals source-specific and configurable through environment variables: `WEB_FZF_HISTORY_REFRESH` defaults to `5s`; `WEB_FZF_GITHUB_REFRESH`, `WEB_FZF_GITLAB_REFRESH`, and `WEB_FZF_DOCKERHUB_REFRESH` default to `1min`.
 - Prefer third-party TUI libraries when improving the interface instead of hand-drawn ANSI output.
 - Avoid introducing new build systems or packaging layers unless the task explicitly requires them.

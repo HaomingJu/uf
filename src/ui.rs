@@ -262,6 +262,7 @@ enum AppModeKind {
     Normal,
     TagList,
     ActionMenu,
+    RepoMenu,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -283,6 +284,7 @@ enum Action {
     SelectTag,
     BackToTags,
     ConfirmDockerAction,
+    ConfirmRepoAction,
 }
 
 fn resolve_action(mode: AppModeKind, key: InputKey) -> Option<Action> {
@@ -290,6 +292,7 @@ fn resolve_action(mode: AppModeKind, key: InputKey) -> Option<Action> {
         AppModeKind::Normal => resolve_normal_action(key),
         AppModeKind::TagList => resolve_tag_list_action(key),
         AppModeKind::ActionMenu => resolve_action_menu_action(key),
+        AppModeKind::RepoMenu => resolve_repo_menu_action(key),
     }
 }
 
@@ -350,6 +353,22 @@ fn resolve_action_menu_action(key: InputKey) -> Option<Action> {
     }
 }
 
+fn resolve_repo_menu_action(key: InputKey) -> Option<Action> {
+    match key.code {
+        InputCode::Esc | InputCode::Backspace => Some(Action::BackToNormal),
+        InputCode::Enter => Some(Action::ConfirmRepoAction),
+        InputCode::Up | InputCode::Char('k') => Some(Action::MoveUp),
+        InputCode::Down | InputCode::Char('j') => Some(Action::MoveDown),
+        InputCode::Char('p') if key.ctrl => Some(Action::MoveUp),
+        InputCode::Char('n') if key.ctrl => Some(Action::MoveDown),
+        InputCode::PageUp => Some(Action::PageUp),
+        InputCode::PageDown => Some(Action::PageDown),
+        InputCode::Char('u') if key.ctrl => Some(Action::PageUp),
+        InputCode::Char('d') if key.ctrl => Some(Action::PageDown),
+        _ => None,
+    }
+}
+
 fn apply_action(
     app: &mut AppState,
     action: Action,
@@ -380,12 +399,17 @@ fn apply_action(
         Action::SelectTag => select_docker_tag(app),
         Action::BackToTags => back_to_docker_tags(app),
         Action::ConfirmDockerAction => confirm_docker_action(app),
+        Action::ConfirmRepoAction => confirm_repo_action(app)?,
     }
     Ok(false)
 }
 
 fn open_selected_entry(app: &mut AppState) -> Result<(), String> {
     if let Some(entry) = app.selected_entry() {
+        if entry.source == "github" || entry.source == "gitlab" {
+            app.mode = AppMode::RepoMenu { selected: 0 };
+            return Ok(());
+        }
         let is_dockerhub = entry.source == "public" || entry.source == "private";
         if is_dockerhub {
             let repo = entry.title.clone();
@@ -422,6 +446,9 @@ fn move_selection_up(app: &mut AppState) {
         }
         | AppMode::ActionMenu {
             ref mut selected, ..
+        }
+        | AppMode::RepoMenu {
+            ref mut selected, ..
         } => {
             if *selected > 0 {
                 *selected -= 1;
@@ -445,7 +472,16 @@ fn move_selection_down(app: &mut AppState) {
         AppMode::ActionMenu {
             ref mut selected, ..
         } => {
-            if *selected + 1 < ACTION_LABELS.len() {
+            let limit = ACTION_LABELS.len();
+            if *selected + 1 < limit {
+                *selected += 1;
+            }
+        }
+        AppMode::RepoMenu {
+            ref mut selected, ..
+        } => {
+            let limit = REPO_ACTION_LABELS.len();
+            if *selected + 1 < limit {
                 *selected += 1;
             }
         }
@@ -459,6 +495,9 @@ fn page_selection_up(app: &mut AppState) {
             ref mut selected, ..
         }
         | AppMode::ActionMenu {
+            ref mut selected, ..
+        }
+        | AppMode::RepoMenu {
             ref mut selected, ..
         } => {
             *selected = selected.saturating_sub(10);
@@ -481,7 +520,18 @@ fn page_selection_down(app: &mut AppState) {
         AppMode::ActionMenu {
             ref mut selected, ..
         } => {
-            *selected = (*selected + 10).min(ACTION_LABELS.len() - 1);
+            let limit = ACTION_LABELS.len();
+            if limit > 0 {
+                *selected = (*selected + 10).min(limit - 1);
+            }
+        }
+        AppMode::RepoMenu {
+            ref mut selected, ..
+        } => {
+            let limit = REPO_ACTION_LABELS.len();
+            if limit > 0 {
+                *selected = (*selected + 10).min(limit - 1);
+            }
         }
     }
 }
@@ -571,6 +621,32 @@ fn confirm_docker_action(app: &mut AppState) {
     }
 }
 
+const REPO_ACTION_LABELS: [&str; 2] = ["Open in browser", "Copy repository address"];
+
+fn confirm_repo_action(app: &mut AppState) -> Result<(), String> {
+    let AppMode::RepoMenu { selected } = app.mode else {
+        return Ok(());
+    };
+
+    let Some(entry) = app.selected_entry().cloned() else {
+        return Ok(());
+    };
+
+    app.mode = AppMode::Normal;
+    match selected {
+        0 => {
+            open_entry(&entry)?;
+            app.message = format!("Opened {}", entry.title);
+        }
+        1 => {
+            copy_to_clipboard(&entry.url);
+            app.message = "Copied repository address.".to_string();
+        }
+        _ => {}
+    }
+    Ok(())
+}
+
 fn render(frame: &mut Frame<'_>, app: &mut AppState) {
     let size = frame.area();
     let layout = Layout::vertical([
@@ -596,14 +672,46 @@ fn render(frame: &mut Frame<'_>, app: &mut AppState) {
             }
         }
         AppModeKind::ActionMenu => {
-            if let AppMode::ActionMenu {
-                repo,
-                tag,
-                tags: _,
-                selected,
-            } = &app.mode
-            {
-                render_action_menu(frame, layout[2], repo, tag.as_deref(), *selected);
+            if app.selected_entry().is_some() {
+                let body =
+                    Layout::horizontal([Constraint::Percentage(42), Constraint::Percentage(58)])
+                        .split(layout[2]);
+                if let AppMode::ActionMenu {
+                    repo,
+                    tag,
+                    tags: _,
+                    selected,
+                } = &app.mode
+                {
+                    render_action_menu(
+                        frame,
+                        body[0],
+                        &format!(
+                            "Action: {repo}{}",
+                            tag.as_ref()
+                                .map(|tag| format!(":{tag}"))
+                                .unwrap_or_default()
+                        ),
+                        &ACTION_LABELS,
+                        *selected,
+                    );
+                }
+                render_preview(frame, body[1], app);
+            }
+        }
+        AppModeKind::RepoMenu => {
+            if let Some(entry) = app.selected_entry() {
+                let body =
+                    Layout::horizontal([Constraint::Percentage(42), Constraint::Percentage(58)])
+                        .split(layout[2]);
+                render_action_menu(
+                    frame,
+                    body[0],
+                    &format!("Action: {}", entry.title),
+                    &REPO_ACTION_LABELS,
+                    app.repo_menu_selected(),
+                );
+                render_preview(frame, body[1], app);
             }
         }
         AppModeKind::Normal => {
@@ -791,11 +899,23 @@ fn render_results(frame: &mut Frame<'_>, area: Rect, app: &mut AppState) {
     let inner_width = area.width.saturating_sub(2 + 2) as usize;
     let type_width = 14usize;
     let sep = 2usize; // spaces between columns
-    let name_width = (inner_width / 2).min(40).max(10);
-    let desc_width = inner_width
-        .saturating_sub(name_width)
-        .saturating_sub(type_width)
-        .saturating_sub(sep * 2);
+    let repo_no_description = app.tab == Tab::GitHub
+        || app.tab == Tab::GitLab
+        || app.tab == Tab::DockerHub
+        || app.tab == Tab::History;
+    let (name_width, desc_width) = if repo_no_description {
+        (
+            inner_width.saturating_sub(type_width).saturating_sub(sep),
+            0,
+        )
+    } else {
+        let name_width = (inner_width / 2).min(40).max(10);
+        let desc_width = inner_width
+            .saturating_sub(name_width)
+            .saturating_sub(type_width)
+            .saturating_sub(sep * 2);
+        (name_width, desc_width)
+    };
 
     let height = area.height.saturating_sub(2) as usize;
     app.set_result_viewport_height(height);
@@ -816,7 +936,11 @@ fn render_results(frame: &mut Frame<'_>, area: Rect, app: &mut AppState) {
                 let entry = &app.entries[idx];
                 let name_col = pad_or_truncate(&entry.title, name_width);
                 let type_col = pad_or_truncate(&entry.source, type_width);
-                let desc_col = truncate_to_width(entry_detail(entry), desc_width);
+                let desc_col = if desc_width == 0 {
+                    String::new()
+                } else {
+                    truncate_to_width(entry_detail(entry), desc_width)
+                };
                 let row_style = Style::default().bg(if row % 2 == 0 {
                     ROW_EVEN_BG
                 } else {
@@ -831,8 +955,16 @@ fn render_results(frame: &mut Frame<'_>, area: Rect, app: &mut AppState) {
                     ),
                     Span::raw("  "),
                     Span::styled(type_col, Style::default().fg(source_color(&entry.source))),
-                    Span::raw("  "),
-                    Span::styled(desc_col, Style::default().fg(Color::Gray)),
+                    if desc_width == 0 {
+                        Span::raw("")
+                    } else {
+                        Span::raw("  ")
+                    },
+                    if desc_width == 0 {
+                        Span::raw("")
+                    } else {
+                        Span::styled(desc_col, Style::default().fg(Color::Gray))
+                    },
                 ];
                 ListItem::new(Line::from(spans)).style(row_style)
             })
@@ -908,7 +1040,9 @@ fn render_preview(frame: &mut Frame<'_>, area: Rect, app: &AppState) {
 fn render_footer(frame: &mut Frame<'_>, area: Rect, app: &AppState) {
     let help = match &app.mode {
         AppMode::TagList { .. } => "Up/Down=move  Ctrl+U/D=page  Enter=select  Backspace=back",
-        AppMode::ActionMenu { .. } => "Up/Down=move  Ctrl+U/D=page  Enter=confirm  Backspace=back",
+        AppMode::ActionMenu { .. } | AppMode::RepoMenu { .. } => {
+            "Up/Down=move  Ctrl+U/D=page  Enter=confirm  Backspace=back"
+        }
         AppMode::Normal => {
             if app.query.is_empty() {
                 "Enter=open  Ctrl+U/D=page  Ctrl+F=refresh tab  Esc=quit"
@@ -990,17 +1124,13 @@ fn render_tag_list(
 fn render_action_menu(
     frame: &mut Frame<'_>,
     area: Rect,
-    repo: &str,
-    tag: Option<&str>,
+    title: &str,
+    labels: &[&str],
     selected: usize,
 ) {
-    let title = match tag {
-        Some(tag) => format!(" Action: {repo}:{tag} "),
-        None => format!(" Action: {repo} "),
-    };
     let block = Block::default()
         .title(Span::styled(
-            title,
+            format!(" {title} "),
             Style::default()
                 .fg(Color::Cyan)
                 .add_modifier(Modifier::BOLD),
@@ -1008,7 +1138,7 @@ fn render_action_menu(
         .borders(Borders::ALL)
         .border_style(Style::default().fg(Color::Cyan));
 
-    let items: Vec<ListItem> = ACTION_LABELS
+    let items: Vec<ListItem> = labels
         .iter()
         .map(|label| ListItem::new(Span::styled(*label, Style::default().fg(Color::White))))
         .collect();
@@ -1277,6 +1407,9 @@ enum AppMode {
         tags: Vec<String>,
         selected: usize,
     },
+    RepoMenu {
+        selected: usize,
+    },
 }
 
 impl AppMode {
@@ -1285,11 +1418,19 @@ impl AppMode {
             AppMode::Normal => AppModeKind::Normal,
             AppMode::TagList { .. } => AppModeKind::TagList,
             AppMode::ActionMenu { .. } => AppModeKind::ActionMenu,
+            AppMode::RepoMenu { .. } => AppModeKind::RepoMenu,
         }
     }
 }
 
 impl AppState {
+    fn repo_menu_selected(&self) -> usize {
+        match self.mode {
+            AppMode::RepoMenu { selected } => selected,
+            _ => 0,
+        }
+    }
+
     fn new(entries: Vec<Entry>) -> Self {
         let haystacks = entry_haystacks(&entries);
         let mut app = Self {
@@ -1591,6 +1732,48 @@ mod tests {
     }
 
     #[test]
+    fn github_entry_opens_action_menu() {
+        let mut app = AppState::new(vec![Entry::new(
+            "juhaoming/web-fzf",
+            "https://github.com/juhaoming/web-fzf",
+            "github",
+            "terminal search launcher",
+        )]);
+        app.tab = Tab::GitHub;
+        app.recompute();
+
+        open_selected_entry(&mut app).unwrap();
+
+        match app.mode {
+            AppMode::RepoMenu { selected } => {
+                assert_eq!(selected, 0);
+            }
+            _ => panic!("expected repository action menu"),
+        }
+    }
+
+    #[test]
+    fn gitlab_entry_opens_action_menu() {
+        let mut app = AppState::new(vec![Entry::new(
+            "platform/psd/auto-server/parking_fusion",
+            "https://gitlab.example.com/platform/psd/auto-server/parking_fusion",
+            "gitlab",
+            "freespace fusion and parking static fusion merge process",
+        )]);
+        app.tab = Tab::GitLab;
+        app.recompute();
+
+        open_selected_entry(&mut app).unwrap();
+
+        match app.mode {
+            AppMode::RepoMenu { selected } => {
+                assert_eq!(selected, 0);
+            }
+            _ => panic!("expected repository action menu"),
+        }
+    }
+
+    #[test]
     fn result_selection_scrolls_only_at_viewport_edges() {
         let entries: Vec<Entry> = (0..8)
             .map(|idx| {
@@ -1693,6 +1876,14 @@ mod tests {
         assert_eq!(
             resolve_action(AppModeKind::ActionMenu, InputKey::new(InputCode::Enter)),
             Some(Action::ConfirmDockerAction)
+        );
+        assert_eq!(
+            resolve_action(AppModeKind::RepoMenu, InputKey::new(InputCode::Enter)),
+            Some(Action::ConfirmRepoAction)
+        );
+        assert_eq!(
+            resolve_action(AppModeKind::RepoMenu, InputKey::new(InputCode::Backspace)),
+            Some(Action::BackToNormal)
         );
     }
 

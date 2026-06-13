@@ -45,17 +45,18 @@ web-fzf
 - `Left` / `Right` or `Tab` to switch between tabs
 - `Ctrl+F` to refresh the current tab
 - `Enter` to open the selected URL
+- On `GitHub` and `GitLab`, `Enter` opens an action menu with `Open in browser` and `Copy repository address`, while the preview pane keeps showing the project details
 - `Backspace` to delete search text, or go back one level inside DockerHub tag/action views
 - `Esc` to quit from the main page, or go back from DockerHub tag/action views
 
 Tabs:
 
 - `History` shows local browser history and bookmarks
-- `GitHub` shows repositories visible to the configured GitHub account or user
-- `GitLab` shows visible GitLab projects
-- `DockerHub` shows repositories belonging to the configured DockerHub user
+- `GitHub` shows repositories visible to the configured GitHub account or user, with `path/repo` shown in the list and details in the preview pane
+- `GitLab` shows visible GitLab projects by `path_with_namespace`, with details in the preview pane
+- `DockerHub` shows repositories belonging to the configured DockerHub user, with the list focused on the repository name and the secondary menu showing the repository description in the preview pane
 
-For DockerHub results, `Enter` opens a tag picker when tags are cached. If no tags are available, it opens the action menu directly so the repository can still be opened in the browser or copied as a `docker pull` command.
+For DockerHub results, `Enter` opens a tag picker when tags are cached. If no tags are available, it opens the action menu directly so the repository can still be opened in the browser or copied as a `docker pull` command. The action menu keeps the repository description visible in the preview pane.
 
 GitHub, GitLab, and DockerHub results are cached locally under the user cache directory. The app opens immediately from cache when available and attempts background refreshes on each source's configured interval.
 
