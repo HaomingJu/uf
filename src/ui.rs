@@ -347,7 +347,7 @@ fn resolve_normal_action(key: InputKey) -> Option<Action> {
         InputCode::Backspace => Some(Action::Backspace),
         InputCode::Char('u') if key.ctrl => Some(Action::PageUp),
         InputCode::Char('d') if key.ctrl => Some(Action::PageDown),
-        InputCode::Char('f') if key.ctrl => Some(Action::RefreshCurrentTab),
+        InputCode::Char('r') if key.ctrl => Some(Action::RefreshCurrentTab),
         InputCode::Char('j') | InputCode::Char('n') if key.ctrl => Some(Action::MoveDown),
         InputCode::Char('k') | InputCode::Char('p') if key.ctrl => Some(Action::MoveUp),
         InputCode::Char('h') if key.ctrl => Some(Action::PreviousTab),
@@ -1156,7 +1156,7 @@ fn render_footer(frame: &mut Frame<'_>, area: Rect, app: &AppState) {
         }
         AppMode::Normal => {
             if app.query.is_empty() {
-                "Enter=open  Ctrl+U/D=page  Ctrl+F=refresh tab  Esc=quit"
+                "Enter=open  Ctrl+U/D=page  Ctrl+R=refresh tab  Esc=quit"
             } else {
                 "Type=fuzzy filter  Ctrl+U/D=page  Enter=open  Esc=quit"
             }

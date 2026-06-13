@@ -43,7 +43,7 @@ uf
 - `PageUp` / `PageDown` to jump
 - `Ctrl+U` / `Ctrl+D` to jump up or down
 - `Left` / `Right` or `Tab` to switch between tabs
-- `Ctrl+F` to refresh the current tab
+- `Ctrl+R` to refresh the current tab
 - `Enter` to open the selected URL
 - On `GitHub` and `GitLab`, `Enter` opens an action menu with `Open in browser` and `Copy repository address`, while the preview pane keeps showing the project details
 - `Backspace` to delete search text, or go back one level inside DockerHub tag/action views
@@ -102,7 +102,7 @@ DockerHub shows only public repositories when no token is provided. With a Perso
 
 Remote tabs always load local cache first. Background refreshes then run according to each source's configured interval. Local data is replaced only after a refresh succeeds with non-empty results. When a background refresh fails or returns no entries, the previous local cache remains available and is not expired or removed.
 
-Press `Ctrl+F` to request an immediate refresh for the current tab. If that tab is already refreshing, the request is ignored.
+Press `Ctrl+R` to request an immediate refresh for the current tab. If that tab is already refreshing, the request is ignored.
 
 ## Debugging
 
