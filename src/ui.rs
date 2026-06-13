@@ -520,6 +520,11 @@ fn move_selection_up(app: &mut AppState) {
 }
 
 fn move_selection_down(app: &mut AppState) {
+    let repo_source = if matches!(app.mode, AppMode::RepoMenu { .. }) {
+        app.selected_entry().map(|e| e.source.clone()).unwrap_or_default()
+    } else {
+        String::new()
+    };
     match app.mode {
         AppMode::Normal => app.move_down(),
         AppMode::TagList {
@@ -542,7 +547,7 @@ fn move_selection_down(app: &mut AppState) {
         AppMode::RepoMenu {
             ref mut selected, ..
         } => {
-            let limit = REPO_ACTION_LABELS.len();
+            let limit = repo_action_labels(&repo_source).len();
             if *selected + 1 < limit {
                 *selected += 1;
             }
@@ -568,6 +573,11 @@ fn page_selection_up(app: &mut AppState) {
 }
 
 fn page_selection_down(app: &mut AppState) {
+    let repo_source = if matches!(app.mode, AppMode::RepoMenu { .. }) {
+        app.selected_entry().map(|e| e.source.clone()).unwrap_or_default()
+    } else {
+        String::new()
+    };
     match app.mode {
         AppMode::Normal => app.page_down(),
         AppMode::TagList {
@@ -590,7 +600,7 @@ fn page_selection_down(app: &mut AppState) {
         AppMode::RepoMenu {
             ref mut selected, ..
         } => {
-            let limit = REPO_ACTION_LABELS.len();
+            let limit = repo_action_labels(&repo_source).len();
             if limit > 0 {
                 *selected = (*selected + 10).min(limit - 1);
             }
@@ -683,7 +693,35 @@ fn confirm_docker_action(app: &mut AppState) {
     }
 }
 
-const REPO_ACTION_LABELS: [&str; 2] = ["Open in browser", "Copy repository address"];
+const REPO_ACTION_LABELS: [&str; 3] = [
+    "Open in browser",
+    "Copy HTTPS address",
+    "Copy SSH address",
+];
+
+const GITHUB_ACTION_LABELS: [&str; 4] = [
+    "Open in browser",
+    "Copy HTTPS address",
+    "Copy SSH address",
+    "Copy gh CLI command",
+];
+
+fn repo_action_labels(source: &str) -> &'static [&'static str] {
+    if source == "github" {
+        &GITHUB_ACTION_LABELS
+    } else {
+        &REPO_ACTION_LABELS
+    }
+}
+
+fn repo_ssh_url(https_url: &str) -> Option<String> {
+    let url = https_url.trim_end_matches('/');
+    let without_scheme = url.strip_prefix("https://")?;
+    let slash = without_scheme.find('/')?;
+    let host = &without_scheme[..slash];
+    let path = without_scheme[slash + 1..].trim_end_matches(".git");
+    Some(format!("git@{}:{}.git", host, path))
+}
 
 fn confirm_repo_action(app: &mut AppState) -> Result<(), String> {
     let AppMode::RepoMenu { selected } = app.mode else {
@@ -702,7 +740,17 @@ fn confirm_repo_action(app: &mut AppState) -> Result<(), String> {
         }
         1 => {
             copy_to_clipboard(&entry.url);
-            app.message = "Copied repository address.".to_string();
+            app.message = format!("Copied HTTPS: {}", entry.url);
+        }
+        2 => {
+            let ssh = repo_ssh_url(&entry.url).unwrap_or_else(|| entry.url.clone());
+            copy_to_clipboard(&ssh);
+            app.message = format!("Copied SSH: {ssh}");
+        }
+        3 if entry.source == "github" => {
+            let cmd = format!("gh repo clone {}", entry.title);
+            copy_to_clipboard(&cmd);
+            app.message = format!("Copied: {cmd}");
         }
         _ => {}
     }
@@ -766,11 +814,12 @@ fn render(frame: &mut Frame<'_>, app: &mut AppState) {
                 let body =
                     Layout::horizontal([Constraint::Percentage(42), Constraint::Percentage(58)])
                         .split(layout[2]);
+                let labels = repo_action_labels(&entry.source.clone());
                 render_action_menu(
                     frame,
                     body[0],
                     &format!("Action: {}", entry.title),
-                    &REPO_ACTION_LABELS,
+                    labels,
                     app.repo_menu_selected(),
                 );
                 render_preview(frame, body[1], app);
