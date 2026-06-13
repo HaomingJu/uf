@@ -222,7 +222,7 @@ fn parse_next_input_key(buffer: &mut Vec<u8>) -> Option<InputKey> {
             buffer.drain(..1);
             Some(InputKey::new(InputCode::Tab))
         }
-        b'\x7F' | b'\x08' => {
+        b'\x7F' => {
             buffer.drain(..1);
             Some(InputKey::new(InputCode::Backspace))
         }
@@ -369,10 +369,10 @@ fn resolve_tag_list_action(key: InputKey) -> Option<Action> {
     match key.code {
         InputCode::Esc | InputCode::Backspace => Some(Action::BackToNormal),
         InputCode::Enter => Some(Action::SelectTag),
-        InputCode::Up | InputCode::Char('k') => Some(Action::MoveUp),
-        InputCode::Down | InputCode::Char('j') => Some(Action::MoveDown),
-        InputCode::Char('p') if key.ctrl => Some(Action::MoveUp),
-        InputCode::Char('n') if key.ctrl => Some(Action::MoveDown),
+        InputCode::Up | InputCode::Char('k') if !key.ctrl => Some(Action::MoveUp),
+        InputCode::Down | InputCode::Char('j') if !key.ctrl => Some(Action::MoveDown),
+        InputCode::Char('p') | InputCode::Char('k') if key.ctrl => Some(Action::MoveUp),
+        InputCode::Char('n') | InputCode::Char('j') if key.ctrl => Some(Action::MoveDown),
         InputCode::PageUp => Some(Action::PageUp),
         InputCode::PageDown => Some(Action::PageDown),
         InputCode::Char('u') if key.ctrl => Some(Action::PageUp),
@@ -385,10 +385,10 @@ fn resolve_action_menu_action(key: InputKey) -> Option<Action> {
     match key.code {
         InputCode::Esc | InputCode::Backspace => Some(Action::BackToTags),
         InputCode::Enter => Some(Action::ConfirmDockerAction),
-        InputCode::Up | InputCode::Char('k') => Some(Action::MoveUp),
-        InputCode::Down | InputCode::Char('j') => Some(Action::MoveDown),
-        InputCode::Char('p') if key.ctrl => Some(Action::MoveUp),
-        InputCode::Char('n') if key.ctrl => Some(Action::MoveDown),
+        InputCode::Up | InputCode::Char('k') if !key.ctrl => Some(Action::MoveUp),
+        InputCode::Down | InputCode::Char('j') if !key.ctrl => Some(Action::MoveDown),
+        InputCode::Char('p') | InputCode::Char('k') if key.ctrl => Some(Action::MoveUp),
+        InputCode::Char('n') | InputCode::Char('j') if key.ctrl => Some(Action::MoveDown),
         InputCode::PageUp => Some(Action::PageUp),
         InputCode::PageDown => Some(Action::PageDown),
         InputCode::Char('u') if key.ctrl => Some(Action::PageUp),
@@ -401,10 +401,10 @@ fn resolve_repo_menu_action(key: InputKey) -> Option<Action> {
     match key.code {
         InputCode::Esc | InputCode::Backspace => Some(Action::BackToNormal),
         InputCode::Enter => Some(Action::ConfirmRepoAction),
-        InputCode::Up | InputCode::Char('k') => Some(Action::MoveUp),
-        InputCode::Down | InputCode::Char('j') => Some(Action::MoveDown),
-        InputCode::Char('p') if key.ctrl => Some(Action::MoveUp),
-        InputCode::Char('n') if key.ctrl => Some(Action::MoveDown),
+        InputCode::Up | InputCode::Char('k') if !key.ctrl => Some(Action::MoveUp),
+        InputCode::Down | InputCode::Char('j') if !key.ctrl => Some(Action::MoveDown),
+        InputCode::Char('p') | InputCode::Char('k') if key.ctrl => Some(Action::MoveUp),
+        InputCode::Char('n') | InputCode::Char('j') if key.ctrl => Some(Action::MoveDown),
         InputCode::PageUp => Some(Action::PageUp),
         InputCode::PageDown => Some(Action::PageDown),
         InputCode::Char('u') if key.ctrl => Some(Action::PageUp),
