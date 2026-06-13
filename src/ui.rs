@@ -2,14 +2,13 @@ use crate::matchers::fuzzy_score;
 use crate::models::Entry;
 use crate::sources::{dockerhub_entry_description, dockerhub_entry_tags};
 use crossterm::cursor::{Hide, Show};
-use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyModifiers};
 use crossterm::execute;
 use crossterm::terminal::{EnterAlternateScreen, LeaveAlternateScreen};
 use ratatui::backend::CrosstermBackend;
 use ratatui::prelude::*;
 use ratatui::widgets::{Block, Borders, Clear, List, ListItem, ListState, Paragraph, Tabs, Wrap};
 use std::cmp::Ordering;
-use std::io::{self, IsTerminal};
+use std::io::{self, IsTerminal, Read};
 use std::process::Command;
 use std::sync::mpsc::{Receiver, Sender, TryRecvError};
 use std::time::{Duration, Instant};
@@ -51,6 +50,7 @@ pub fn run_ui(
     let mut terminal = Terminal::new(CrosstermBackend::new(io::stdout()))
         .map_err(|err| format!("create terminal: {err}"))?;
     let mut last_cursor_toggle = Instant::now();
+    let mut input = InputReader::default();
 
     let result = loop {
         if last_cursor_toggle.elapsed() >= CURSOR_BLINK_INTERVAL {
@@ -70,18 +70,12 @@ pub fn run_ui(
             execute!(stdout, Hide).map_err(|err| format!("hide cursor: {err}"))?;
         }
 
-        if event::poll(Duration::from_millis(150)).map_err(|err| format!("poll input: {err}"))? {
-            match event::read().map_err(|err| format!("read input: {err}"))? {
-                Event::Key(key) => {
-                    if handle_key(&mut app, key, &refresh_requests)? {
-                        break Ok(());
-                    }
-                    app.cursor_visible = true;
-                    last_cursor_toggle = Instant::now();
-                }
-                Event::Resize(_, _) => {}
-                _ => {}
+        if let Some(key) = input.read_key()? {
+            if handle_key(&mut app, key, &refresh_requests)? {
+                break Ok(());
             }
+            app.cursor_visible = true;
+            last_cursor_toggle = Instant::now();
         }
     };
 
@@ -112,13 +106,151 @@ pub fn best_entry<'a>(entries: &'a [Entry], query: &str) -> Option<&'a Entry> {
         .and_then(|(_, idx)| entries.get(idx))
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct InputKey {
+    code: InputCode,
+    ctrl: bool,
+}
+
+impl InputKey {
+    fn new(code: InputCode) -> Self {
+        Self { code, ctrl: false }
+    }
+
+    fn ctrl(ch: char) -> Self {
+        Self {
+            code: InputCode::Char(ch),
+            ctrl: true,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum InputCode {
+    Esc,
+    Enter,
+    Backspace,
+    Char(char),
+    Up,
+    Down,
+    PageUp,
+    PageDown,
+    Home,
+    End,
+    Left,
+    Right,
+    Tab,
+}
+
+#[derive(Default)]
+struct InputReader {
+    buffer: Vec<u8>,
+}
+
+impl InputReader {
+    fn read_key(&mut self) -> Result<Option<InputKey>, String> {
+        let mut bytes = [0u8; 64];
+        match io::stdin().read(&mut bytes) {
+            Ok(0) => {}
+            Ok(count) => self.buffer.extend_from_slice(&bytes[..count]),
+            Err(err) if err.kind() == io::ErrorKind::Interrupted => {}
+            Err(err) if err.kind() == io::ErrorKind::WouldBlock => {}
+            Err(err) => return Err(format!("read input: {err}")),
+        }
+
+        Ok(parse_next_input_key(&mut self.buffer))
+    }
+}
+
+fn parse_next_input_key(buffer: &mut Vec<u8>) -> Option<InputKey> {
+    let first = *buffer.first()?;
+    match first {
+        b'\x1B' => parse_escape_input_key(buffer),
+        b'\r' => {
+            buffer.drain(..1);
+            Some(InputKey::new(InputCode::Enter))
+        }
+        b'\n' => {
+            buffer.drain(..1);
+            Some(InputKey::ctrl('j'))
+        }
+        b'\t' => {
+            buffer.drain(..1);
+            Some(InputKey::new(InputCode::Tab))
+        }
+        b'\x7F' | b'\x08' => {
+            buffer.drain(..1);
+            Some(InputKey::new(InputCode::Backspace))
+        }
+        byte @ b'\x01'..=b'\x1A' => {
+            buffer.drain(..1);
+            let ch = (byte - 1 + b'a') as char;
+            Some(InputKey::ctrl(ch))
+        }
+        _ => parse_text_input_key(buffer),
+    }
+}
+
+fn parse_escape_input_key(buffer: &mut Vec<u8>) -> Option<InputKey> {
+    if buffer.len() >= 3 && buffer[1] == b'[' {
+        let key = match buffer[2] {
+            b'A' => Some((InputCode::Up, 3)),
+            b'B' => Some((InputCode::Down, 3)),
+            b'C' => Some((InputCode::Right, 3)),
+            b'D' => Some((InputCode::Left, 3)),
+            b'H' => Some((InputCode::Home, 3)),
+            b'F' => Some((InputCode::End, 3)),
+            b'1' | b'7' if buffer.get(3) == Some(&b'~') => Some((InputCode::Home, 4)),
+            b'4' | b'8' if buffer.get(3) == Some(&b'~') => Some((InputCode::End, 4)),
+            b'5' if buffer.get(3) == Some(&b'~') => Some((InputCode::PageUp, 4)),
+            b'6' if buffer.get(3) == Some(&b'~') => Some((InputCode::PageDown, 4)),
+            _ => None,
+        };
+        if let Some((code, consumed)) = key {
+            buffer.drain(..consumed);
+            return Some(InputKey::new(code));
+        }
+    }
+
+    buffer.drain(..1);
+    Some(InputKey::new(InputCode::Esc))
+}
+
+fn parse_text_input_key(buffer: &mut Vec<u8>) -> Option<InputKey> {
+    let first = *buffer.first()?;
+    let width = utf8_char_width(first);
+    if width == 0 {
+        buffer.drain(..1);
+        return None;
+    }
+    if buffer.len() < width {
+        return None;
+    }
+
+    let Ok(text) = std::str::from_utf8(&buffer[..width]) else {
+        buffer.drain(..1);
+        return None;
+    };
+    let ch = text.chars().next()?;
+    buffer.drain(..width);
+    Some(InputKey::new(InputCode::Char(ch)))
+}
+
+fn utf8_char_width(byte: u8) -> usize {
+    match byte {
+        0x00..=0x7F => 1,
+        0xC2..=0xDF => 2,
+        0xE0..=0xEF => 3,
+        0xF0..=0xF4 => 4,
+        _ => 0,
+    }
+}
+
 fn handle_key(
     app: &mut AppState,
-    key: KeyEvent,
+    key: InputKey,
     refresh_requests: &Sender<RefreshRequest>,
 ) -> Result<bool, String> {
-    let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
-
     match &app.mode {
         AppMode::TagList { .. } => return handle_key_tag_list(app, key),
         AppMode::ActionMenu { .. } => return handle_key_action_menu(app, key),
@@ -126,8 +258,8 @@ fn handle_key(
     }
 
     match key.code {
-        KeyCode::Esc => return Ok(true),
-        KeyCode::Enter => {
+        InputCode::Esc => return Ok(true),
+        InputCode::Enter => {
             if let Some(entry) = app.selected_entry() {
                 let is_dockerhub = entry.source == "public" || entry.source == "private";
                 if is_dockerhub {
@@ -149,38 +281,36 @@ fn handle_key(
                 return Ok(false);
             }
         }
-        KeyCode::Backspace => {
+        InputCode::Backspace => {
             app.backspace();
         }
-        KeyCode::Char('u') if ctrl => {
+        InputCode::Char('u') if key.ctrl => {
             app.clear_query();
         }
-        KeyCode::Char('f') if ctrl => {
+        InputCode::Char('f') if key.ctrl => {
             let request = app.tab.refresh_request();
             let _ = refresh_requests.send(request);
             app.message = format!("Requested {} refresh.", app.tab.name());
         }
-        KeyCode::Char('j') | KeyCode::Char('n') if ctrl => app.move_down(),
-        KeyCode::Char('k') | KeyCode::Char('p') if ctrl => app.move_up(),
-        KeyCode::Char('h') if ctrl => app.previous_tab(),
-        KeyCode::Char('l') if ctrl => app.next_tab(),
-        KeyCode::Char(c) if key.modifiers.is_empty() || key.modifiers == KeyModifiers::SHIFT => {
-            app.push_char(c);
-        }
-        KeyCode::Up => app.move_up(),
-        KeyCode::Down => app.move_down(),
-        KeyCode::PageUp => app.page_up(),
-        KeyCode::PageDown => app.page_down(),
-        KeyCode::Home => app.jump_top(),
-        KeyCode::End => app.jump_bottom(),
-        KeyCode::Left => app.previous_tab(),
-        KeyCode::Right | KeyCode::Tab => app.next_tab(),
+        InputCode::Char('j') | InputCode::Char('n') if key.ctrl => app.move_down(),
+        InputCode::Char('k') | InputCode::Char('p') if key.ctrl => app.move_up(),
+        InputCode::Char('h') if key.ctrl => app.previous_tab(),
+        InputCode::Char('l') if key.ctrl => app.next_tab(),
+        InputCode::Char(c) if !key.ctrl => app.push_char(c),
+        InputCode::Up => app.move_up(),
+        InputCode::Down => app.move_down(),
+        InputCode::PageUp => app.page_up(),
+        InputCode::PageDown => app.page_down(),
+        InputCode::Home => app.jump_top(),
+        InputCode::End => app.jump_bottom(),
+        InputCode::Left => app.previous_tab(),
+        InputCode::Right | InputCode::Tab => app.next_tab(),
         _ => {}
     }
     Ok(false)
 }
 
-fn handle_key_tag_list(app: &mut AppState, key: KeyEvent) -> Result<bool, String> {
+fn handle_key_tag_list(app: &mut AppState, key: InputKey) -> Result<bool, String> {
     let AppMode::TagList {
         ref repo,
         ref tags,
@@ -190,11 +320,11 @@ fn handle_key_tag_list(app: &mut AppState, key: KeyEvent) -> Result<bool, String
         return Ok(false);
     };
     match key.code {
-        KeyCode::Esc => {
+        InputCode::Esc => {
             app.mode = AppMode::Normal;
             app.message = "Type to search.".to_string();
         }
-        KeyCode::Enter => {
+        InputCode::Enter => {
             let tag = tags[*selected].clone();
             let repo = repo.clone();
             let tags = tags.clone();
@@ -205,12 +335,12 @@ fn handle_key_tag_list(app: &mut AppState, key: KeyEvent) -> Result<bool, String
                 selected: 0,
             };
         }
-        KeyCode::Up | KeyCode::Char('k') => {
+        InputCode::Up | InputCode::Char('k') => {
             if *selected > 0 {
                 *selected -= 1;
             }
         }
-        KeyCode::Down | KeyCode::Char('j') => {
+        InputCode::Down | InputCode::Char('j') => {
             if *selected + 1 < tags.len() {
                 *selected += 1;
             }
@@ -222,7 +352,7 @@ fn handle_key_tag_list(app: &mut AppState, key: KeyEvent) -> Result<bool, String
 
 const ACTION_LABELS: [&str; 2] = ["Open in browser", "Copy docker pull command"];
 
-fn handle_key_action_menu(app: &mut AppState, key: KeyEvent) -> Result<bool, String> {
+fn handle_key_action_menu(app: &mut AppState, key: InputKey) -> Result<bool, String> {
     let AppMode::ActionMenu {
         ref repo,
         ref tag,
@@ -233,7 +363,7 @@ fn handle_key_action_menu(app: &mut AppState, key: KeyEvent) -> Result<bool, Str
         return Ok(false);
     };
     match key.code {
-        KeyCode::Esc => {
+        InputCode::Esc => {
             let repo = repo.clone();
             let tags = tags.clone();
             app.mode = AppMode::TagList {
@@ -242,7 +372,7 @@ fn handle_key_action_menu(app: &mut AppState, key: KeyEvent) -> Result<bool, Str
                 selected: 0,
             };
         }
-        KeyCode::Enter => {
+        InputCode::Enter => {
             let action = *selected;
             let repo = repo.clone();
             let tag = tag.clone();
@@ -261,12 +391,12 @@ fn handle_key_action_menu(app: &mut AppState, key: KeyEvent) -> Result<bool, Str
                 _ => {}
             }
         }
-        KeyCode::Up | KeyCode::Char('k') => {
+        InputCode::Up | InputCode::Char('k') => {
             if *selected > 0 {
                 *selected -= 1;
             }
         }
-        KeyCode::Down | KeyCode::Char('j') => {
+        InputCode::Down | InputCode::Char('j') => {
             if *selected + 1 < ACTION_LABELS.len() {
                 *selected += 1;
             }
@@ -1127,7 +1257,10 @@ impl Drop for TerminalSession {
 
 #[cfg(test)]
 mod tests {
-    use super::{best_entry, display_width, rank_entries, tab_count, AppState, Tab};
+    use super::{
+        best_entry, display_width, parse_next_input_key, rank_entries, tab_count, AppState,
+        InputCode, InputKey, Tab,
+    };
     use crate::models::Entry;
 
     #[test]
@@ -1181,6 +1314,33 @@ mod tests {
         assert_eq!(app.query, "中文");
         app.backspace();
         assert_eq!(app.query, "中");
+    }
+
+    #[test]
+    fn raw_input_distinguishes_enter_from_ctrl_j() {
+        let mut enter = b"\r".to_vec();
+        assert_eq!(
+            parse_next_input_key(&mut enter),
+            Some(InputKey::new(InputCode::Enter))
+        );
+
+        let mut ctrl_j = b"\n".to_vec();
+        assert_eq!(parse_next_input_key(&mut ctrl_j), Some(InputKey::ctrl('j')));
+    }
+
+    #[test]
+    fn raw_input_parses_arrows_and_utf8_text() {
+        let mut down = b"\x1B[B".to_vec();
+        assert_eq!(
+            parse_next_input_key(&mut down),
+            Some(InputKey::new(InputCode::Down))
+        );
+
+        let mut text = "中".as_bytes().to_vec();
+        assert_eq!(
+            parse_next_input_key(&mut text),
+            Some(InputKey::new(InputCode::Char('中')))
+        );
     }
 
     #[test]
