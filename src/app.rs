@@ -1,8 +1,8 @@
 use crate::config::Config;
 use crate::sources::{
     browser_source_signature, fetch_dockerhub_page, fetch_github_page, fetch_gitlab_page,
-    load_cached_remote_entries, load_local_browser_entries, remote_cache_needs_refresh,
-    save_remote_cache, with_source_logs_suppressed,
+    load_cached_remote_with_refresh_check, load_local_browser_entries, save_remote_cache,
+    with_source_logs_suppressed,
 };
 use crate::ui::{run_ui, RefreshRequest, UiEvent};
 use std::env;
@@ -16,31 +16,69 @@ use std::time::Duration;
 
 pub fn run() -> Result<(), String> {
     let config = parse_args(env::args().skip(1))?;
-    let mut entries = Vec::new();
 
-    if config.include_browser {
-        match load_local_browser_entries() {
-            Ok(mut rows) => entries.append(&mut rows),
-            Err(err) => eprintln!("browser sources: {err}"),
+    // 并行加载：浏览器历史 + 三个远程缓存同时读取，同时判断是否需要刷新
+    let include_browser = config.include_browser;
+    let include_github = config.include_github;
+    let include_gitlab = config.include_gitlab;
+    let include_dockerhub = config.include_dockerhub;
+    let github_interval = config.github_refresh_interval;
+    let gitlab_interval = config.gitlab_refresh_interval;
+    let dockerhub_interval = config.dockerhub_refresh_interval;
+
+    let browser_handle = thread::spawn(move || {
+        if include_browser {
+            match load_local_browser_entries() {
+                Ok(rows) => rows,
+                Err(err) => {
+                    eprintln!("browser sources: {err}");
+                    Vec::new()
+                }
+            }
+        } else {
+            Vec::new()
         }
-    }
+    });
+    let github_handle = thread::spawn(move || {
+        if include_github {
+            load_cached_remote_with_refresh_check("github", github_interval)
+        } else {
+            (Vec::new(), false)
+        }
+    });
+    let gitlab_handle = thread::spawn(move || {
+        if include_gitlab {
+            load_cached_remote_with_refresh_check("gitlab", gitlab_interval)
+        } else {
+            (Vec::new(), false)
+        }
+    });
+    let dockerhub_handle = thread::spawn(move || {
+        if include_dockerhub {
+            load_cached_remote_with_refresh_check("dockerhub", dockerhub_interval)
+        } else {
+            (Vec::new(), false)
+        }
+    });
 
-    if config.include_github {
-        entries.extend(load_cached_remote_entries("github"));
-    }
-    if config.include_gitlab {
-        entries.extend(load_cached_remote_entries("gitlab"));
-    }
-    if config.include_dockerhub {
-        entries.extend(load_cached_remote_entries("dockerhub"));
-    }
+    let browser_entries = browser_handle.join().unwrap_or_default();
+    let (github_entries, github_needs_refresh) = github_handle.join().unwrap_or_default();
+    let (gitlab_entries, gitlab_needs_refresh) = gitlab_handle.join().unwrap_or_default();
+    let (dockerhub_entries, dockerhub_needs_refresh) = dockerhub_handle.join().unwrap_or_default();
+
+    let mut entries = Vec::with_capacity(
+        browser_entries.len() + github_entries.len() + gitlab_entries.len() + dockerhub_entries.len(),
+    );
+    entries.extend(browser_entries);
+    entries.extend(github_entries);
+    entries.extend(gitlab_entries);
+    entries.extend(dockerhub_entries);
 
     let (tx, rx) = mpsc::channel::<UiEvent>();
     let (refresh_tx, refresh_rx) = mpsc::channel::<RefreshRequest>();
     let refresh_state = RefreshState::default();
 
-    if config.include_github && remote_cache_needs_refresh("github", config.github_refresh_interval)
-    {
+    if github_needs_refresh {
         try_spawn_github_refresh(
             config.clone(),
             tx.clone(),
@@ -48,8 +86,7 @@ pub fn run() -> Result<(), String> {
             Duration::from_millis(800),
         );
     }
-    if config.include_gitlab && remote_cache_needs_refresh("gitlab", config.gitlab_refresh_interval)
-    {
+    if gitlab_needs_refresh {
         try_spawn_gitlab_refresh(
             config.clone(),
             tx.clone(),
@@ -57,9 +94,7 @@ pub fn run() -> Result<(), String> {
             Duration::from_millis(800),
         );
     }
-    if config.include_dockerhub
-        && remote_cache_needs_refresh("dockerhub", config.dockerhub_refresh_interval)
-    {
+    if dockerhub_needs_refresh {
         try_spawn_dockerhub_refresh(
             config.clone(),
             tx.clone(),

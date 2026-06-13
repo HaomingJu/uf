@@ -110,22 +110,42 @@ pub fn browser_source_signature() -> Option<u64> {
 }
 
 pub fn load_cached_remote_entries(source: &str) -> Vec<Entry> {
-    remote_cache_path(source)
-        .and_then(|path| fs::read_to_string(path).ok())
-        .and_then(|text| parse_cached_entries(&text).ok())
-        .map(|cached| cached.entries)
-        .unwrap_or_default()
+    load_cached_remote(source, None).0
 }
 
 pub fn remote_cache_needs_refresh(source: &str, refresh_interval: Duration) -> bool {
-    let entries = load_cached_remote_entries(source);
-    if entries.is_empty() {
-        return true;
-    }
-    match remote_cache_age(source) {
-        Some(age) => age >= refresh_interval,
-        None => true,
-    }
+    let (entries, needs_refresh) = load_cached_remote(source, Some(refresh_interval));
+    entries.is_empty() || needs_refresh
+}
+
+// 一次读取同时返回 entries 和是否需要刷新，避免两次读文件
+pub fn load_cached_remote_with_refresh_check(
+    source: &str,
+    refresh_interval: Duration,
+) -> (Vec<Entry>, bool) {
+    let (entries, needs_refresh) = load_cached_remote(source, Some(refresh_interval));
+    let needs_refresh = entries.is_empty() || needs_refresh;
+    (entries, needs_refresh)
+}
+
+fn load_cached_remote(source: &str, refresh_interval: Option<Duration>) -> (Vec<Entry>, bool) {
+    let Some(path) = remote_cache_path(source) else {
+        return (Vec::new(), true);
+    };
+    let Ok(text) = fs::read_to_string(&path) else {
+        return (Vec::new(), true);
+    };
+    let Ok(cached) = parse_cached_entries(&text) else {
+        return (Vec::new(), true);
+    };
+    let needs_refresh = match refresh_interval {
+        None => false,
+        Some(interval) => {
+            let age = remote_cache_age(source).unwrap_or(Duration::MAX);
+            age >= interval
+        }
+    };
+    (cached.entries, needs_refresh)
 }
 
 pub fn save_remote_cache(source: &str, entries: &[Entry]) -> Result<(), String> {
