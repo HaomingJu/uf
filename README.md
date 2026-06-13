@@ -20,6 +20,7 @@ Search uses `nucleo-matcher` for fuzzy matching. The UI keeps precomputed search
 ### Homebrew (macOS / Linux)
 
 ```bash
+brew trust haomingju/tap
 brew install HaomingJu/tap/uf
 ```
 

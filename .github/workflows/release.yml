@@ -74,3 +74,88 @@ jobs:
         with:
           files: artifacts/*
           generate_release_notes: true
+
+  bump-homebrew:
+    runs-on: ubuntu-latest
+    needs: [release]
+    permissions:
+      contents: read
+    steps:
+      - name: Download all sha256 artifacts
+        uses: actions/download-artifact@v4
+        with:
+          merge-multiple: true
+          path: artifacts
+
+      - name: Extract sha256 values
+        id: sha
+        run: |
+          VERSION="${{ github.ref_name }}"
+          VER="${VERSION#v}"
+          SHA_MAC_ARM=$(awk '{print $1}' "artifacts/uf-${VERSION}-aarch64-apple-darwin.tar.gz.sha256")
+          SHA_MAC_X86=$(awk '{print $1}' "artifacts/uf-${VERSION}-x86_64-apple-darwin.tar.gz.sha256")
+          SHA_LIN_ARM=$(awk '{print $1}' "artifacts/uf-${VERSION}-aarch64-unknown-linux-gnu.tar.gz.sha256")
+          SHA_LIN_X86=$(awk '{print $1}' "artifacts/uf-${VERSION}-x86_64-unknown-linux-gnu.tar.gz.sha256")
+          echo "ver=${VER}" >> "$GITHUB_OUTPUT"
+          echo "sha_mac_arm=${SHA_MAC_ARM}" >> "$GITHUB_OUTPUT"
+          echo "sha_mac_x86=${SHA_MAC_X86}" >> "$GITHUB_OUTPUT"
+          echo "sha_lin_arm=${SHA_LIN_ARM}" >> "$GITHUB_OUTPUT"
+          echo "sha_lin_x86=${SHA_LIN_X86}" >> "$GITHUB_OUTPUT"
+
+      - name: Checkout homebrew-tap
+        uses: actions/checkout@v4
+        with:
+          repository: HaomingJu/homebrew-tap
+          token: ${{ secrets.TAP_GITHUB_TOKEN }}
+          path: homebrew-tap
+
+      - name: Update formula
+        run: |
+          VER="${{ steps.sha.outputs.ver }}"
+          SHA_MAC_ARM="${{ steps.sha.outputs.sha_mac_arm }}"
+          SHA_MAC_X86="${{ steps.sha.outputs.sha_mac_x86 }}"
+          SHA_LIN_ARM="${{ steps.sha.outputs.sha_lin_arm }}"
+          SHA_LIN_X86="${{ steps.sha.outputs.sha_lin_x86 }}"
+          FORMULA="homebrew-tap/Formula/uf.rb"
+
+          sed -i "s/^  version \".*\"/  version \"${VER}\"/" "$FORMULA"
+
+          python3 - "$FORMULA" "$SHA_MAC_ARM" "$SHA_MAC_X86" "$SHA_LIN_ARM" "$SHA_LIN_X86" <<'PYEOF'
+          import sys
+          formula_path = sys.argv[1]
+          new_shas = sys.argv[2:]
+          with open(formula_path, 'r') as f:
+              lines = f.readlines()
+          occurrence = 0
+          out = []
+          for line in lines:
+              stripped = line.lstrip()
+              if stripped.startswith('sha256 "') and occurrence < 4:
+                  indent = line[: len(line) - len(line.lstrip())]
+                  out.append(f'{indent}sha256 "{new_shas[occurrence]}"\n')
+                  occurrence += 1
+              else:
+                  out.append(line)
+          with open(formula_path, 'w') as f:
+              f.writelines(out)
+          PYEOF
+
+      - name: Open PR
+        env:
+          GH_TOKEN: ${{ secrets.TAP_GITHUB_TOKEN }}
+        run: |
+          VER="${{ steps.sha.outputs.ver }}"
+          BRANCH="bump-uf-${VER}"
+          cd homebrew-tap
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git checkout -b "$BRANCH"
+          git add Formula/uf.rb
+          git commit -m "uf ${VER}"
+          git push origin "$BRANCH"
+          gh pr create \
+            --repo HaomingJu/homebrew-tap \
+            --head "$BRANCH" \
+            --base main \
+            --title "uf ${VER}" \
+            --body "Bump uf to ${VER}."
