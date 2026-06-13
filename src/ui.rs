@@ -52,30 +52,69 @@ pub fn run_ui(
     let mut last_cursor_toggle = Instant::now();
     let mut input = InputReader::default();
 
+    // 进入循环前先渲染一帧，避免启动时白屏
+    terminal
+        .draw(|frame| render(frame, &mut app))
+        .map_err(|err| format!("draw terminal: {err}"))?;
+
     let result = loop {
+        // 阻塞等待输入，或 0.5s 超时（用于光标闪烁）
+        let first_key = input.read_key()?;
+
+        // 更新光标闪烁状态
         if last_cursor_toggle.elapsed() >= CURSOR_BLINK_INTERVAL {
             app.cursor_visible = !app.cursor_visible;
             last_cursor_toggle = Instant::now();
         }
 
+        // 处理后台刷新事件
+        drain_events(&mut app, &events);
+
+        if first_key.is_none() {
+            // 超时：处理后台事件，重绘（光标闪烁）
+            terminal
+                .draw(|frame| render(frame, &mut app))
+                .map_err(|err| format!("draw terminal: {err}"))?;
+            let mut stdout = io::stdout();
+            if app.cursor_visible {
+                execute!(stdout, Show).map_err(|err| format!("show cursor: {err}"))?;
+            } else {
+                execute!(stdout, Hide).map_err(|err| format!("hide cursor: {err}"))?;
+            }
+            continue;
+        }
+
+        // 批量处理：先处理第一个键，再把缓冲区里已有的全部键一起处理
+        // 这样粘贴一段文字时只触发一次 recompute
+        app.cursor_visible = true;
+        last_cursor_toggle = Instant::now();
+
+        let mut should_quit = false;
+        let mut key = first_key;
+        loop {
+            let Some(k) = key else { break };
+            if handle_key(&mut app, k, &refresh_requests)? {
+                should_quit = true;
+                break;
+            }
+            key = input.next_buffered_key();
+        }
+
+        if should_quit {
+            break Ok(());
+        }
+
+        // 所有按键处理完后统一 recompute 并重绘一次
+        app.flush_deferred_recompute();
         drain_events(&mut app, &events);
         terminal
             .draw(|frame| render(frame, &mut app))
             .map_err(|err| format!("draw terminal: {err}"))?;
-
         let mut stdout = io::stdout();
         if app.cursor_visible {
             execute!(stdout, Show).map_err(|err| format!("show cursor: {err}"))?;
         } else {
             execute!(stdout, Hide).map_err(|err| format!("hide cursor: {err}"))?;
-        }
-
-        if let Some(key) = input.read_key()? {
-            if handle_key(&mut app, key, &refresh_requests)? {
-                break Ok(());
-            }
-            app.cursor_visible = true;
-            last_cursor_toggle = Instant::now();
         }
     };
 
@@ -148,8 +187,9 @@ struct InputReader {
 }
 
 impl InputReader {
+    // 阻塞读：等待至少一个字节（stty min 1），超时返回 None（stty time N）
     fn read_key(&mut self) -> Result<Option<InputKey>, String> {
-        let mut bytes = [0u8; 64];
+        let mut bytes = [0u8; 256];
         match io::stdin().read(&mut bytes) {
             Ok(0) => {}
             Ok(count) => self.buffer.extend_from_slice(&bytes[..count]),
@@ -157,8 +197,12 @@ impl InputReader {
             Err(err) if err.kind() == io::ErrorKind::WouldBlock => {}
             Err(err) => return Err(format!("read input: {err}")),
         }
-
         Ok(parse_next_input_key(&mut self.buffer))
+    }
+
+    // 从内部缓冲区解析出下一个按键（不做任何 IO）
+    fn next_buffered_key(&mut self) -> Option<InputKey> {
+        parse_next_input_key(&mut self.buffer)
     }
 }
 
@@ -1392,6 +1436,7 @@ struct AppState {
     tab: Tab,
     cursor_visible: bool,
     mode: AppMode,
+    dirty: bool,
 }
 
 enum AppMode {
@@ -1445,9 +1490,17 @@ impl AppState {
             tab: Tab::History,
             cursor_visible: true,
             mode: AppMode::Normal,
+            dirty: false,
         };
         app.recompute();
         app
+    }
+
+    fn flush_deferred_recompute(&mut self) {
+        if self.dirty {
+            self.recompute();
+            self.dirty = false;
+        }
     }
 
     fn recompute(&mut self) {
@@ -1520,14 +1573,14 @@ impl AppState {
         self.query.push(ch);
         self.selected = 0;
         self.scroll_start = 0;
-        self.recompute();
+        self.dirty = true;
     }
 
     fn backspace(&mut self) {
         self.pop_grapheme();
         self.selected = 0;
         self.scroll_start = 0;
-        self.recompute();
+        self.dirty = true;
     }
 
     fn pop_grapheme(&mut self) {
@@ -1622,7 +1675,7 @@ impl TerminalSession {
             });
 
         Command::new("stty")
-            .args(["raw", "-echo", "min", "0", "time", "1"])
+            .args(["raw", "-echo", "min", "1", "time", "5"])
             .status()
             .map_err(|err| format!("enable raw mode: {err}"))?;
 
