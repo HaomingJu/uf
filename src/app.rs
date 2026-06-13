@@ -4,13 +4,15 @@ use crate::sources::{
     load_cached_remote_entries, load_local_browser_entries, remote_cache_needs_refresh,
     save_remote_cache, with_source_logs_suppressed,
 };
-use crate::ui::{run_ui, UiEvent};
+use crate::ui::{run_ui, RefreshRequest, UiEvent};
 use std::env;
 use std::sync::mpsc;
+use std::sync::{
+    atomic::{AtomicBool, Ordering as AtomicOrdering},
+    Arc,
+};
 use std::thread;
 use std::time::Duration;
-
-const BROWSER_REFRESH_INTERVAL: Duration = Duration::from_secs(5);
 
 pub fn run() -> Result<(), String> {
     let config = parse_args(env::args().skip(1))?;
@@ -34,22 +36,64 @@ pub fn run() -> Result<(), String> {
     }
 
     let (tx, rx) = mpsc::channel::<UiEvent>();
+    let (refresh_tx, refresh_rx) = mpsc::channel::<RefreshRequest>();
+    let refresh_state = RefreshState::default();
 
-    if config.include_github && remote_cache_needs_refresh("github") {
-        spawn_github_refresh(config.clone(), tx.clone());
+    if config.include_github && remote_cache_needs_refresh("github", config.github_refresh_interval)
+    {
+        try_spawn_github_refresh(
+            config.clone(),
+            tx.clone(),
+            refresh_state.github.clone(),
+            Duration::from_millis(800),
+        );
     }
-    if config.include_gitlab && remote_cache_needs_refresh("gitlab") {
-        spawn_gitlab_refresh(config.clone(), tx.clone());
+    if config.include_gitlab && remote_cache_needs_refresh("gitlab", config.gitlab_refresh_interval)
+    {
+        try_spawn_gitlab_refresh(
+            config.clone(),
+            tx.clone(),
+            refresh_state.gitlab.clone(),
+            Duration::from_millis(800),
+        );
     }
-    if config.include_dockerhub && remote_cache_needs_refresh("dockerhub") {
-        spawn_dockerhub_refresh(config.clone(), tx.clone());
+    if config.include_dockerhub
+        && remote_cache_needs_refresh("dockerhub", config.dockerhub_refresh_interval)
+    {
+        try_spawn_dockerhub_refresh(
+            config.clone(),
+            tx.clone(),
+            refresh_state.dockerhub.clone(),
+            Duration::from_millis(800),
+        );
     }
     if config.include_browser {
-        spawn_browser_refresh(tx.clone());
+        spawn_browser_refresh(
+            config.history_refresh_interval,
+            tx.clone(),
+            refresh_state.history.clone(),
+        );
     }
+    spawn_refresh_request_handler(config, tx.clone(), refresh_state, refresh_rx);
 
     drop(tx);
-    run_ui(entries, rx)
+    run_ui(entries, rx, refresh_tx)
+}
+
+#[derive(Clone, Default)]
+struct RefreshState {
+    history: Arc<AtomicBool>,
+    github: Arc<AtomicBool>,
+    gitlab: Arc<AtomicBool>,
+    dockerhub: Arc<AtomicBool>,
+}
+
+struct RefreshGuard(Arc<AtomicBool>);
+
+impl Drop for RefreshGuard {
+    fn drop(&mut self) {
+        self.0.store(false, AtomicOrdering::Release);
+    }
 }
 
 fn parse_args<I>(args: I) -> Result<Config, String>
@@ -122,9 +166,83 @@ Options:\n\
     );
 }
 
-fn spawn_github_refresh(config: Config, tx: mpsc::Sender<UiEvent>) {
+fn spawn_refresh_request_handler(
+    config: Config,
+    tx: mpsc::Sender<UiEvent>,
+    state: RefreshState,
+    rx: mpsc::Receiver<RefreshRequest>,
+) {
     thread::spawn(move || {
-        thread::sleep(Duration::from_millis(800));
+        while let Ok(request) = rx.recv() {
+            match request {
+                RefreshRequest::History if config.include_browser => {
+                    try_spawn_history_refresh(tx.clone(), state.history.clone());
+                }
+                RefreshRequest::GitHub if config.include_github => {
+                    try_spawn_github_refresh(
+                        config.clone(),
+                        tx.clone(),
+                        state.github.clone(),
+                        Duration::ZERO,
+                    );
+                }
+                RefreshRequest::GitLab if config.include_gitlab => {
+                    try_spawn_gitlab_refresh(
+                        config.clone(),
+                        tx.clone(),
+                        state.gitlab.clone(),
+                        Duration::ZERO,
+                    );
+                }
+                RefreshRequest::DockerHub if config.include_dockerhub => {
+                    try_spawn_dockerhub_refresh(
+                        config.clone(),
+                        tx.clone(),
+                        state.dockerhub.clone(),
+                        Duration::ZERO,
+                    );
+                }
+                RefreshRequest::History => {
+                    let _ = tx.send(UiEvent::Status("History source is disabled.".to_string()));
+                }
+                RefreshRequest::GitHub => {
+                    let _ = tx.send(UiEvent::Status("GitHub source is disabled.".to_string()));
+                }
+                RefreshRequest::GitLab => {
+                    let _ = tx.send(UiEvent::Status("GitLab source is disabled.".to_string()));
+                }
+                RefreshRequest::DockerHub => {
+                    let _ = tx.send(UiEvent::Status("DockerHub source is disabled.".to_string()));
+                }
+            }
+        }
+    });
+}
+
+fn try_mark_refreshing(source: &str, in_progress: &AtomicBool, tx: &mpsc::Sender<UiEvent>) -> bool {
+    if in_progress
+        .compare_exchange(false, true, AtomicOrdering::AcqRel, AtomicOrdering::Acquire)
+        .is_ok()
+    {
+        true
+    } else {
+        let _ = tx.send(UiEvent::Status(format!("{source} is already refreshing.")));
+        false
+    }
+}
+
+fn try_spawn_github_refresh(
+    config: Config,
+    tx: mpsc::Sender<UiEvent>,
+    in_progress: Arc<AtomicBool>,
+    delay: Duration,
+) {
+    if !try_mark_refreshing("GitHub", &in_progress, &tx) {
+        return;
+    }
+    thread::spawn(move || {
+        let _guard = RefreshGuard(in_progress);
+        thread::sleep(delay);
         let _ = tx.send(UiEvent::Status(
             "Refreshing GitHub in background...".to_string(),
         ));
@@ -137,8 +255,7 @@ fn spawn_github_refresh(config: Config, tx: mpsc::Sender<UiEvent>) {
                         break;
                     }
                     let row_count = rows.len();
-                    all_rows.extend(rows.clone());
-                    let _ = tx.send(UiEvent::AddEntries(rows));
+                    all_rows.extend(rows);
                     let _ = tx.send(UiEvent::Status(format!(
                         "GitHub refreshing... page {page} loaded ({row_count} items)."
                     )));
@@ -153,14 +270,36 @@ fn spawn_github_refresh(config: Config, tx: mpsc::Sender<UiEvent>) {
                 }
             }
         }
+        if all_rows.is_empty() {
+            let _ = tx.send(UiEvent::Status(
+                "GitHub refresh returned no entries; keeping existing data.".to_string(),
+            ));
+            return;
+        }
+        let count = all_rows.len();
         let _ = save_remote_cache("github", &all_rows);
-        let _ = tx.send(UiEvent::Status("GitHub refresh complete.".to_string()));
+        let _ = tx.send(UiEvent::ReplaceSourceEntries {
+            sources: vec!["github".to_string()],
+            entries: all_rows,
+        });
+        let _ = tx.send(UiEvent::Status(format!(
+            "GitHub refresh complete ({count} items)."
+        )));
     });
 }
 
-fn spawn_gitlab_refresh(config: Config, tx: mpsc::Sender<UiEvent>) {
+fn try_spawn_gitlab_refresh(
+    config: Config,
+    tx: mpsc::Sender<UiEvent>,
+    in_progress: Arc<AtomicBool>,
+    delay: Duration,
+) {
+    if !try_mark_refreshing("GitLab", &in_progress, &tx) {
+        return;
+    }
     thread::spawn(move || {
-        thread::sleep(Duration::from_millis(800));
+        let _guard = RefreshGuard(in_progress);
+        thread::sleep(delay);
         let _ = tx.send(UiEvent::Status(
             "Refreshing GitLab in background...".to_string(),
         ));
@@ -173,8 +312,7 @@ fn spawn_gitlab_refresh(config: Config, tx: mpsc::Sender<UiEvent>) {
                         break;
                     }
                     let row_count = rows.len();
-                    all_rows.extend(rows.clone());
-                    let _ = tx.send(UiEvent::AddEntries(rows));
+                    all_rows.extend(rows);
                     let _ = tx.send(UiEvent::Status(format!(
                         "GitLab refreshing... page {page} loaded ({row_count} items)."
                     )));
@@ -189,14 +327,36 @@ fn spawn_gitlab_refresh(config: Config, tx: mpsc::Sender<UiEvent>) {
                 }
             }
         }
+        if all_rows.is_empty() {
+            let _ = tx.send(UiEvent::Status(
+                "GitLab refresh returned no entries; keeping existing data.".to_string(),
+            ));
+            return;
+        }
+        let count = all_rows.len();
         let _ = save_remote_cache("gitlab", &all_rows);
-        let _ = tx.send(UiEvent::Status("GitLab refresh complete.".to_string()));
+        let _ = tx.send(UiEvent::ReplaceSourceEntries {
+            sources: vec!["gitlab".to_string()],
+            entries: all_rows,
+        });
+        let _ = tx.send(UiEvent::Status(format!(
+            "GitLab refresh complete ({count} items)."
+        )));
     });
 }
 
-fn spawn_dockerhub_refresh(config: Config, tx: mpsc::Sender<UiEvent>) {
+fn try_spawn_dockerhub_refresh(
+    config: Config,
+    tx: mpsc::Sender<UiEvent>,
+    in_progress: Arc<AtomicBool>,
+    delay: Duration,
+) {
+    if !try_mark_refreshing("DockerHub", &in_progress, &tx) {
+        return;
+    }
     thread::spawn(move || {
-        thread::sleep(Duration::from_millis(800));
+        let _guard = RefreshGuard(in_progress);
+        thread::sleep(delay);
         let _ = tx.send(UiEvent::Status(
             "Refreshing DockerHub in background...".to_string(),
         ));
@@ -209,8 +369,7 @@ fn spawn_dockerhub_refresh(config: Config, tx: mpsc::Sender<UiEvent>) {
                         break;
                     }
                     let row_count = rows.len();
-                    all_rows.extend(rows.clone());
-                    let _ = tx.send(UiEvent::AddEntries(rows));
+                    all_rows.extend(rows);
                     let _ = tx.send(UiEvent::Status(format!(
                         "DockerHub refreshing... page {page} loaded ({row_count} items)."
                     )));
@@ -225,16 +384,33 @@ fn spawn_dockerhub_refresh(config: Config, tx: mpsc::Sender<UiEvent>) {
                 }
             }
         }
+        if all_rows.is_empty() {
+            let _ = tx.send(UiEvent::Status(
+                "DockerHub refresh returned no entries; keeping existing data.".to_string(),
+            ));
+            return;
+        }
+        let count = all_rows.len();
         let _ = save_remote_cache("dockerhub", &all_rows);
-        let _ = tx.send(UiEvent::Status("DockerHub refresh complete.".to_string()));
+        let _ = tx.send(UiEvent::ReplaceSourceEntries {
+            sources: vec!["public".to_string(), "private".to_string()],
+            entries: all_rows,
+        });
+        let _ = tx.send(UiEvent::Status(format!(
+            "DockerHub refresh complete ({count} items)."
+        )));
     });
 }
 
-fn spawn_browser_refresh(tx: mpsc::Sender<UiEvent>) {
+fn spawn_browser_refresh(
+    interval: Duration,
+    tx: mpsc::Sender<UiEvent>,
+    in_progress: Arc<AtomicBool>,
+) {
     thread::spawn(move || {
         let mut last_signature = browser_source_signature();
         loop {
-            thread::sleep(BROWSER_REFRESH_INTERVAL);
+            thread::sleep(interval);
             let Some(signature) = browser_source_signature() else {
                 continue;
             };
@@ -243,26 +419,43 @@ fn spawn_browser_refresh(tx: mpsc::Sender<UiEvent>) {
             }
             last_signature = Some(signature);
 
-            let _ = tx.send(UiEvent::Status(
-                "Refreshing browser history in background...".to_string(),
-            ));
-            match with_source_logs_suppressed(load_local_browser_entries) {
-                Ok(rows) => {
-                    let sources = vec!["browser-history".to_string(), "bookmark".to_string()];
-                    let count = rows.len();
-                    let _ = tx.send(UiEvent::ReplaceSourceEntries {
-                        sources,
-                        entries: rows,
-                    });
-                    let _ = tx.send(UiEvent::Status(format!(
-                        "Browser history refreshed ({count} items)."
-                    )));
+            try_spawn_history_refresh(tx.clone(), in_progress.clone());
+        }
+    });
+}
+
+fn try_spawn_history_refresh(tx: mpsc::Sender<UiEvent>, in_progress: Arc<AtomicBool>) {
+    if !try_mark_refreshing("History", &in_progress, &tx) {
+        return;
+    }
+    thread::spawn(move || {
+        let _guard = RefreshGuard(in_progress);
+        let _ = tx.send(UiEvent::Status(
+            "Refreshing browser history in background...".to_string(),
+        ));
+        match with_source_logs_suppressed(load_local_browser_entries) {
+            Ok(rows) => {
+                if rows.is_empty() {
+                    let _ = tx.send(UiEvent::Status(
+                        "Browser history refresh returned no entries; keeping existing data."
+                            .to_string(),
+                    ));
+                    return;
                 }
-                Err(err) => {
-                    let _ = tx.send(UiEvent::Status(format!(
-                        "Browser history refresh failed: {err}"
-                    )));
-                }
+                let sources = vec!["browser-history".to_string(), "bookmark".to_string()];
+                let count = rows.len();
+                let _ = tx.send(UiEvent::ReplaceSourceEntries {
+                    sources,
+                    entries: rows,
+                });
+                let _ = tx.send(UiEvent::Status(format!(
+                    "Browser history refreshed ({count} items)."
+                )));
+            }
+            Err(err) => {
+                let _ = tx.send(UiEvent::Status(format!(
+                    "Browser history refresh failed: {err}"
+                )));
             }
         }
     });

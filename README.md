@@ -41,6 +41,7 @@ web-fzf
 - `Up` / `Down` to move selection
 - `PageUp` / `PageDown` to jump
 - `Left` / `Right` or `Tab` to switch between tabs
+- `Ctrl+F` to refresh the current tab
 - `Enter` to open the selected URL
 - `Esc` to quit
 
@@ -51,9 +52,9 @@ Tabs:
 - `GitLab` shows visible GitLab projects
 - `DockerHub` shows repositories belonging to the configured DockerHub user
 
-GitHub, GitLab, and DockerHub results are cached locally under the user cache directory. The app opens immediately from cache when available and refreshes stale data in the background.
+GitHub, GitLab, and DockerHub results are cached locally under the user cache directory. The app opens immediately from cache when available and attempts background refreshes on each source's configured interval.
 
-If any remote source or protected browser source cannot be read, the app keeps the remaining sources available instead of exiting.
+If any remote source or protected browser source cannot be read, the app keeps the remaining sources available instead of exiting. Remote cache data remains usable when refreshes fail.
 
 ## Configuration
 
@@ -82,8 +83,20 @@ Environment variables:
 - `DOCKERHUB_TOKEN`
 - `DOCKERHUB_USERNAME`
 - `WEB_FZF_PREVIEW` to re-enable the preview pane (`1`, `true`, `yes`, or `on`)
+- `WEB_FZF_HISTORY_REFRESH` history refresh interval, default `5s`
+- `WEB_FZF_GITHUB_REFRESH` GitHub refresh interval, default `1min`
+- `WEB_FZF_GITLAB_REFRESH` GitLab refresh interval, default `1min`
+- `WEB_FZF_DOCKERHUB_REFRESH` DockerHub refresh interval, default `1min`
+
+Refresh interval values may be plain seconds such as `60`, seconds such as `5s`, or minutes such as `1min`.
 
 DockerHub shows only public repositories when no token is provided. With a Personal Access Token (PAT), private repositories are also visible.
+
+## Refresh behavior
+
+Remote tabs always load local cache first. Background refreshes then run according to each source's configured interval. Local data is replaced only after a refresh succeeds with non-empty results. When a background refresh fails or returns no entries, the previous local cache remains available and is not expired or removed.
+
+Press `Ctrl+F` to request an immediate refresh for the current tab. If that tab is already refreshing, the request is ignored.
 
 ## Debugging
 
@@ -128,4 +141,3 @@ grep dockerhub debug.log
 ```bash
 cargo test
 ```
-

@@ -14,7 +14,6 @@ thread_local! {
     static SUPPRESS_SOURCE_LOGS: Cell<bool> = const { Cell::new(false) };
 }
 
-const REMOTE_CACHE_TTL: Duration = Duration::from_secs(30 * 60);
 const DOCKERHUB_TAGS_MARKER: &str = "\nWEB_FZF_TAGS\t";
 
 struct CachedEntries {
@@ -116,16 +115,13 @@ pub fn load_cached_remote_entries(source: &str) -> Vec<Entry> {
         .unwrap_or_default()
 }
 
-pub fn remote_cache_needs_refresh(source: &str) -> bool {
+pub fn remote_cache_needs_refresh(source: &str, refresh_interval: Duration) -> bool {
     let entries = load_cached_remote_entries(source);
     if entries.is_empty() {
         return true;
     }
-    if source == "dockerhub" && dockerhub_cache_missing_tags(&entries) {
-        return true;
-    }
     match remote_cache_age(source) {
-        Some(age) => age > REMOTE_CACHE_TTL,
+        Some(age) => age >= refresh_interval,
         None => true,
     }
 }
@@ -756,16 +752,6 @@ pub fn dockerhub_entry_tags(entry: &Entry) -> Vec<String> {
         .unwrap_or_default()
 }
 
-fn is_dockerhub_entry(entry: &Entry) -> bool {
-    entry.source == "public" || entry.source == "private"
-}
-
-fn dockerhub_cache_missing_tags(entries: &[Entry]) -> bool {
-    entries
-        .iter()
-        .any(|entry| is_dockerhub_entry(entry) && dockerhub_entry_tags(entry).is_empty())
-}
-
 fn dockerhub_detail_with_tags(description: &str, tags: &[String]) -> String {
     if tags.is_empty() {
         description.to_string()
@@ -1098,8 +1084,8 @@ for item in results:
 #[cfg(test)]
 mod tests {
     use super::{
-        deduplicate, dockerhub_cache_missing_tags, dockerhub_detail_with_tags,
-        dockerhub_entry_description, dockerhub_entry_tags, parse_tsv_entries,
+        deduplicate, dockerhub_detail_with_tags, dockerhub_entry_description, dockerhub_entry_tags,
+        parse_tsv_entries,
     };
     use crate::models::Entry;
 
@@ -1136,13 +1122,5 @@ mod tests {
 
         assert_eq!(dockerhub_entry_description(&entry), "Small base image");
         assert_eq!(dockerhub_entry_tags(&entry), vec!["latest", "1.0"]);
-    }
-
-    #[test]
-    fn dockerhub_cache_missing_tags_detects_old_cache_entries() {
-        let old_entry = Entry::new("me/app", "https://hub.docker.com/r/me/app", "public", "");
-        let github_entry = Entry::new("me/repo", "https://github.com/me/repo", "github", "");
-
-        assert!(dockerhub_cache_missing_tags(&[old_entry, github_entry]));
     }
 }

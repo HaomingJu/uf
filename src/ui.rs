@@ -11,7 +11,7 @@ use ratatui::widgets::{Block, Borders, Clear, List, ListItem, ListState, Paragra
 use std::cmp::Ordering;
 use std::io::{self, IsTerminal};
 use std::process::Command;
-use std::sync::mpsc::{Receiver, TryRecvError};
+use std::sync::mpsc::{Receiver, Sender, TryRecvError};
 use std::time::{Duration, Instant};
 use unicode_segmentation::UnicodeSegmentation;
 use unicode_width::UnicodeWidthStr;
@@ -22,7 +22,6 @@ const ROW_ODD_BG: Color = Color::Rgb(18, 24, 32);
 const SELECTED_ROW_BG: Color = Color::Rgb(53, 63, 73);
 
 pub enum UiEvent {
-    AddEntries(Vec<Entry>),
     ReplaceSourceEntries {
         sources: Vec<String>,
         entries: Vec<Entry>,
@@ -30,7 +29,19 @@ pub enum UiEvent {
     Status(String),
 }
 
-pub fn run_ui(entries: Vec<Entry>, events: Receiver<UiEvent>) -> Result<(), String> {
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum RefreshRequest {
+    History,
+    GitHub,
+    GitLab,
+    DockerHub,
+}
+
+pub fn run_ui(
+    entries: Vec<Entry>,
+    events: Receiver<UiEvent>,
+    refresh_requests: Sender<RefreshRequest>,
+) -> Result<(), String> {
     if !io::stdin().is_terminal() || !io::stdout().is_terminal() {
         return Err("interactive terminal required".to_string());
     }
@@ -62,7 +73,7 @@ pub fn run_ui(entries: Vec<Entry>, events: Receiver<UiEvent>) -> Result<(), Stri
         if event::poll(Duration::from_millis(150)).map_err(|err| format!("poll input: {err}"))? {
             match event::read().map_err(|err| format!("read input: {err}"))? {
                 Event::Key(key) => {
-                    if handle_key(&mut app, key)? {
+                    if handle_key(&mut app, key, &refresh_requests)? {
                         break Ok(());
                     }
                     app.cursor_visible = true;
@@ -81,13 +92,6 @@ pub fn run_ui(entries: Vec<Entry>, events: Receiver<UiEvent>) -> Result<(), Stri
 fn drain_events(app: &mut AppState, events: &Receiver<UiEvent>) {
     loop {
         match events.try_recv() {
-            Ok(UiEvent::AddEntries(rows)) => {
-                let count = rows.len();
-                if count > 0 {
-                    app.append_entries(rows);
-                    app.message = format!("Loaded {count} new entries.");
-                }
-            }
             Ok(UiEvent::ReplaceSourceEntries { sources, entries }) => {
                 let count = entries.len();
                 app.replace_entries_for_sources(&sources, entries);
@@ -108,7 +112,11 @@ pub fn best_entry<'a>(entries: &'a [Entry], query: &str) -> Option<&'a Entry> {
         .and_then(|(_, idx)| entries.get(idx))
 }
 
-fn handle_key(app: &mut AppState, key: KeyEvent) -> Result<bool, String> {
+fn handle_key(
+    app: &mut AppState,
+    key: KeyEvent,
+    refresh_requests: &Sender<RefreshRequest>,
+) -> Result<bool, String> {
     let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
 
     match &app.mode {
@@ -146,6 +154,11 @@ fn handle_key(app: &mut AppState, key: KeyEvent) -> Result<bool, String> {
         }
         KeyCode::Char('u') if ctrl => {
             app.clear_query();
+        }
+        KeyCode::Char('f') if ctrl => {
+            let request = app.tab.refresh_request();
+            let _ = refresh_requests.send(request);
+            app.message = format!("Requested {} refresh.", app.tab.name());
         }
         KeyCode::Char('j') | KeyCode::Char('n') if ctrl => app.move_down(),
         KeyCode::Char('k') | KeyCode::Char('p') if ctrl => app.move_up(),
@@ -596,9 +609,9 @@ fn render_footer(frame: &mut Frame<'_>, area: Rect, app: &AppState) {
         AppMode::ActionMenu { .. } => "Up/Down=move  Enter=confirm  Esc=back to tags",
         AppMode::Normal => {
             if app.query.is_empty() {
-                "Enter=open  Esc=quit  Up/Down=move  PageUp/PageDown=page"
+                "Enter=open  Ctrl+F=refresh tab  Esc=quit  Up/Down=move"
             } else {
-                "Type=fuzzy filter  Backspace=delete  Enter=open  Esc=quit"
+                "Type=fuzzy filter  Ctrl+F=refresh tab  Enter=open  Esc=quit"
             }
         }
     };
@@ -784,6 +797,24 @@ impl Tab {
             Tab::GitHub => entry.source == "github",
             Tab::GitLab => entry.source == "gitlab",
             Tab::DockerHub => entry.source == "public" || entry.source == "private",
+        }
+    }
+
+    fn refresh_request(self) -> RefreshRequest {
+        match self {
+            Tab::History => RefreshRequest::History,
+            Tab::GitHub => RefreshRequest::GitHub,
+            Tab::GitLab => RefreshRequest::GitLab,
+            Tab::DockerHub => RefreshRequest::DockerHub,
+        }
+    }
+
+    fn name(self) -> &'static str {
+        match self {
+            Tab::History => "History",
+            Tab::GitHub => "GitHub",
+            Tab::GitLab => "GitLab",
+            Tab::DockerHub => "DockerHub",
         }
     }
 }
@@ -1033,13 +1064,6 @@ impl AppState {
     fn previous_tab(&mut self) {
         self.tab = self.tab.previous();
         self.selected = 0;
-        self.recompute();
-    }
-
-    fn append_entries(&mut self, rows: Vec<Entry>) {
-        let mut merged = std::mem::take(&mut self.entries);
-        merged.extend(rows);
-        self.entries = deduplicate_entries(merged);
         self.recompute();
     }
 
