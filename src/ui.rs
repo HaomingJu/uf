@@ -251,159 +251,259 @@ fn handle_key(
     key: InputKey,
     refresh_requests: &Sender<RefreshRequest>,
 ) -> Result<bool, String> {
-    match &app.mode {
-        AppMode::TagList { .. } => return handle_key_tag_list(app, key),
-        AppMode::ActionMenu { .. } => return handle_key_action_menu(app, key),
-        AppMode::Normal => {}
-    }
+    let Some(action) = resolve_action(app.mode.kind(), key) else {
+        return Ok(false);
+    };
+    apply_action(app, action, refresh_requests)
+}
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum AppModeKind {
+    Normal,
+    TagList,
+    ActionMenu,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum Action {
+    Quit,
+    OpenSelected,
+    MoveUp,
+    MoveDown,
+    PageUp,
+    PageDown,
+    JumpTop,
+    JumpBottom,
+    PreviousTab,
+    NextTab,
+    RefreshCurrentTab,
+    ClearQuery,
+    Backspace,
+    InsertChar(char),
+    BackToNormal,
+    SelectTag,
+    BackToTags,
+    ConfirmDockerAction,
+}
+
+fn resolve_action(mode: AppModeKind, key: InputKey) -> Option<Action> {
+    match mode {
+        AppModeKind::Normal => resolve_normal_action(key),
+        AppModeKind::TagList => resolve_tag_list_action(key),
+        AppModeKind::ActionMenu => resolve_action_menu_action(key),
+    }
+}
+
+fn resolve_normal_action(key: InputKey) -> Option<Action> {
     match key.code {
-        InputCode::Esc => return Ok(true),
-        InputCode::Enter => {
-            if let Some(entry) = app.selected_entry() {
-                let is_dockerhub = entry.source == "public" || entry.source == "private";
-                if is_dockerhub {
-                    let repo = entry.title.clone();
-                    let tags = dockerhub_entry_tags(entry);
-                    if tags.is_empty() {
-                        app.message = format!("No cached tags found for {repo}");
-                    } else {
-                        app.mode = AppMode::TagList {
-                            repo,
-                            tags,
-                            selected: 0,
-                        };
-                    }
-                    return Ok(false);
-                }
-                open_entry(entry)?;
-                app.message = format!("Opened {}", entry.title);
-                return Ok(false);
-            }
-        }
-        InputCode::Backspace => {
-            app.backspace();
-        }
-        InputCode::Char('u') if key.ctrl => {
-            app.clear_query();
-        }
-        InputCode::Char('f') if key.ctrl => {
+        InputCode::Esc => Some(Action::Quit),
+        InputCode::Enter => Some(Action::OpenSelected),
+        InputCode::Backspace => Some(Action::Backspace),
+        InputCode::Char('u') if key.ctrl => Some(Action::ClearQuery),
+        InputCode::Char('f') if key.ctrl => Some(Action::RefreshCurrentTab),
+        InputCode::Char('j') | InputCode::Char('n') if key.ctrl => Some(Action::MoveDown),
+        InputCode::Char('k') | InputCode::Char('p') if key.ctrl => Some(Action::MoveUp),
+        InputCode::Char('h') if key.ctrl => Some(Action::PreviousTab),
+        InputCode::Char('l') if key.ctrl => Some(Action::NextTab),
+        InputCode::Char(c) if !key.ctrl => Some(Action::InsertChar(c)),
+        InputCode::Up => Some(Action::MoveUp),
+        InputCode::Down => Some(Action::MoveDown),
+        InputCode::PageUp => Some(Action::PageUp),
+        InputCode::PageDown => Some(Action::PageDown),
+        InputCode::Home => Some(Action::JumpTop),
+        InputCode::End => Some(Action::JumpBottom),
+        InputCode::Left => Some(Action::PreviousTab),
+        InputCode::Right | InputCode::Tab => Some(Action::NextTab),
+        _ => None,
+    }
+}
+
+fn resolve_tag_list_action(key: InputKey) -> Option<Action> {
+    match key.code {
+        InputCode::Esc => Some(Action::BackToNormal),
+        InputCode::Enter => Some(Action::SelectTag),
+        InputCode::Up | InputCode::Char('k') => Some(Action::MoveUp),
+        InputCode::Down | InputCode::Char('j') => Some(Action::MoveDown),
+        _ => None,
+    }
+}
+
+fn resolve_action_menu_action(key: InputKey) -> Option<Action> {
+    match key.code {
+        InputCode::Esc => Some(Action::BackToTags),
+        InputCode::Enter => Some(Action::ConfirmDockerAction),
+        InputCode::Up | InputCode::Char('k') => Some(Action::MoveUp),
+        InputCode::Down | InputCode::Char('j') => Some(Action::MoveDown),
+        _ => None,
+    }
+}
+
+fn apply_action(
+    app: &mut AppState,
+    action: Action,
+    refresh_requests: &Sender<RefreshRequest>,
+) -> Result<bool, String> {
+    match action {
+        Action::Quit => return Ok(true),
+        Action::OpenSelected => open_selected_entry(app)?,
+        Action::MoveUp => move_selection_up(app),
+        Action::MoveDown => move_selection_down(app),
+        Action::PageUp => app.page_up(),
+        Action::PageDown => app.page_down(),
+        Action::JumpTop => app.jump_top(),
+        Action::JumpBottom => app.jump_bottom(),
+        Action::PreviousTab => app.previous_tab(),
+        Action::NextTab => app.next_tab(),
+        Action::RefreshCurrentTab => {
             let request = app.tab.refresh_request();
             let _ = refresh_requests.send(request);
             app.message = format!("Requested {} refresh.", app.tab.name());
         }
-        InputCode::Char('j') | InputCode::Char('n') if key.ctrl => app.move_down(),
-        InputCode::Char('k') | InputCode::Char('p') if key.ctrl => app.move_up(),
-        InputCode::Char('h') if key.ctrl => app.previous_tab(),
-        InputCode::Char('l') if key.ctrl => app.next_tab(),
-        InputCode::Char(c) if !key.ctrl => app.push_char(c),
-        InputCode::Up => app.move_up(),
-        InputCode::Down => app.move_down(),
-        InputCode::PageUp => app.page_up(),
-        InputCode::PageDown => app.page_down(),
-        InputCode::Home => app.jump_top(),
-        InputCode::End => app.jump_bottom(),
-        InputCode::Left => app.previous_tab(),
-        InputCode::Right | InputCode::Tab => app.next_tab(),
-        _ => {}
+        Action::ClearQuery => app.clear_query(),
+        Action::Backspace => app.backspace(),
+        Action::InsertChar(ch) => app.push_char(ch),
+        Action::BackToNormal => {
+            app.mode = AppMode::Normal;
+            app.message = "Type to search.".to_string();
+        }
+        Action::SelectTag => select_docker_tag(app),
+        Action::BackToTags => back_to_docker_tags(app),
+        Action::ConfirmDockerAction => confirm_docker_action(app),
     }
     Ok(false)
 }
 
-fn handle_key_tag_list(app: &mut AppState, key: InputKey) -> Result<bool, String> {
-    let AppMode::TagList {
-        ref repo,
-        ref tags,
-        ref mut selected,
-    } = app.mode
-    else {
-        return Ok(false);
-    };
-    match key.code {
-        InputCode::Esc => {
-            app.mode = AppMode::Normal;
-            app.message = "Type to search.".to_string();
+fn open_selected_entry(app: &mut AppState) -> Result<(), String> {
+    if let Some(entry) = app.selected_entry() {
+        let is_dockerhub = entry.source == "public" || entry.source == "private";
+        if is_dockerhub {
+            let repo = entry.title.clone();
+            let tags = dockerhub_entry_tags(entry);
+            if tags.is_empty() {
+                app.message = format!("No cached tags found for {repo}");
+            } else {
+                app.mode = AppMode::TagList {
+                    repo,
+                    tags,
+                    selected: 0,
+                };
+            }
+            return Ok(());
         }
-        InputCode::Enter => {
-            let tag = tags[*selected].clone();
-            let repo = repo.clone();
-            let tags = tags.clone();
-            app.mode = AppMode::ActionMenu {
-                repo,
-                tag,
-                tags,
-                selected: 0,
-            };
+
+        let title = entry.title.clone();
+        open_entry(entry)?;
+        app.message = format!("Opened {title}");
+    }
+    Ok(())
+}
+
+fn move_selection_up(app: &mut AppState) {
+    match app.mode {
+        AppMode::Normal => app.move_up(),
+        AppMode::TagList {
+            ref mut selected, ..
         }
-        InputCode::Up | InputCode::Char('k') => {
+        | AppMode::ActionMenu {
+            ref mut selected, ..
+        } => {
             if *selected > 0 {
                 *selected -= 1;
             }
         }
-        InputCode::Down | InputCode::Char('j') => {
+    }
+}
+
+fn move_selection_down(app: &mut AppState) {
+    match app.mode {
+        AppMode::Normal => app.move_down(),
+        AppMode::TagList {
+            ref tags,
+            ref mut selected,
+            ..
+        } => {
             if *selected + 1 < tags.len() {
                 *selected += 1;
             }
         }
-        _ => {}
-    }
-    Ok(false)
-}
-
-const ACTION_LABELS: [&str; 2] = ["Open in browser", "Copy docker pull command"];
-
-fn handle_key_action_menu(app: &mut AppState, key: InputKey) -> Result<bool, String> {
-    let AppMode::ActionMenu {
-        ref repo,
-        ref tag,
-        ref tags,
-        ref mut selected,
-    } = app.mode
-    else {
-        return Ok(false);
-    };
-    match key.code {
-        InputCode::Esc => {
-            let repo = repo.clone();
-            let tags = tags.clone();
-            app.mode = AppMode::TagList {
-                repo,
-                tags,
-                selected: 0,
-            };
-        }
-        InputCode::Enter => {
-            let action = *selected;
-            let repo = repo.clone();
-            let tag = tag.clone();
-            app.mode = AppMode::Normal;
-            match action {
-                0 => {
-                    let url = format!("https://hub.docker.com/r/{}/tags?name={}", repo, tag);
-                    let _ = webbrowser::open(&url);
-                    app.message = format!("Opened {repo}:{tag} in browser");
-                }
-                1 => {
-                    let cmd = format!("docker pull {}:{}", repo, tag);
-                    copy_to_clipboard(&cmd);
-                    app.message = format!("Copied: {cmd}");
-                }
-                _ => {}
-            }
-        }
-        InputCode::Up | InputCode::Char('k') => {
-            if *selected > 0 {
-                *selected -= 1;
-            }
-        }
-        InputCode::Down | InputCode::Char('j') => {
+        AppMode::ActionMenu {
+            ref mut selected, ..
+        } => {
             if *selected + 1 < ACTION_LABELS.len() {
                 *selected += 1;
             }
         }
+    }
+}
+
+fn select_docker_tag(app: &mut AppState) {
+    let AppMode::TagList {
+        ref repo,
+        ref tags,
+        selected,
+    } = app.mode
+    else {
+        return;
+    };
+
+    let tag = tags[selected].clone();
+    let repo = repo.clone();
+    let tags = tags.clone();
+    app.mode = AppMode::ActionMenu {
+        repo,
+        tag,
+        tags,
+        selected: 0,
+    };
+}
+
+fn back_to_docker_tags(app: &mut AppState) {
+    let AppMode::ActionMenu {
+        ref repo, ref tags, ..
+    } = app.mode
+    else {
+        return;
+    };
+
+    let repo = repo.clone();
+    let tags = tags.clone();
+    app.mode = AppMode::TagList {
+        repo,
+        tags,
+        selected: 0,
+    };
+}
+
+const ACTION_LABELS: [&str; 2] = ["Open in browser", "Copy docker pull command"];
+
+fn confirm_docker_action(app: &mut AppState) {
+    let AppMode::ActionMenu {
+        ref repo,
+        ref tag,
+        selected,
+        ..
+    } = app.mode
+    else {
+        return;
+    };
+
+    let action = selected;
+    let repo = repo.clone();
+    let tag = tag.clone();
+    app.mode = AppMode::Normal;
+    match action {
+        0 => {
+            let url = format!("https://hub.docker.com/r/{}/tags?name={}", repo, tag);
+            let _ = webbrowser::open(&url);
+            app.message = format!("Opened {repo}:{tag} in browser");
+        }
+        1 => {
+            let cmd = format!("docker pull {}:{}", repo, tag);
+            copy_to_clipboard(&cmd);
+            app.message = format!("Copied: {cmd}");
+        }
         _ => {}
     }
-    Ok(false)
 }
 
 fn render(frame: &mut Frame<'_>, app: &AppState) {
@@ -1074,6 +1174,16 @@ enum AppMode {
     },
 }
 
+impl AppMode {
+    fn kind(&self) -> AppModeKind {
+        match self {
+            AppMode::Normal => AppModeKind::Normal,
+            AppMode::TagList { .. } => AppModeKind::TagList,
+            AppMode::ActionMenu { .. } => AppModeKind::ActionMenu,
+        }
+    }
+}
+
 impl AppState {
     fn new(entries: Vec<Entry>) -> Self {
         let mut app = Self {
@@ -1258,8 +1368,8 @@ impl Drop for TerminalSession {
 #[cfg(test)]
 mod tests {
     use super::{
-        best_entry, display_width, parse_next_input_key, rank_entries, tab_count, AppState,
-        InputCode, InputKey, Tab,
+        best_entry, display_width, parse_next_input_key, rank_entries, resolve_action, tab_count,
+        Action, AppModeKind, AppState, InputCode, InputKey, Tab,
     };
     use crate::models::Entry;
 
@@ -1340,6 +1450,30 @@ mod tests {
         assert_eq!(
             parse_next_input_key(&mut text),
             Some(InputKey::new(InputCode::Char('中')))
+        );
+    }
+
+    #[test]
+    fn normal_keymap_distinguishes_enter_from_ctrl_j() {
+        assert_eq!(
+            resolve_action(AppModeKind::Normal, InputKey::new(InputCode::Enter)),
+            Some(Action::OpenSelected)
+        );
+        assert_eq!(
+            resolve_action(AppModeKind::Normal, InputKey::ctrl('j')),
+            Some(Action::MoveDown)
+        );
+    }
+
+    #[test]
+    fn modal_keymaps_keep_enter_mode_specific() {
+        assert_eq!(
+            resolve_action(AppModeKind::TagList, InputKey::new(InputCode::Enter)),
+            Some(Action::SelectTag)
+        );
+        assert_eq!(
+            resolve_action(AppModeKind::ActionMenu, InputKey::new(InputCode::Enter)),
+            Some(Action::ConfirmDockerAction)
         );
     }
 
