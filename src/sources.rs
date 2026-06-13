@@ -1,5 +1,7 @@
 use crate::config::Config;
 use crate::models::Entry;
+use plist::Value as PlistValue;
+use serde_json::Value as JsonValue;
 use std::cell::Cell;
 use std::collections::hash_map::DefaultHasher;
 use std::collections::HashSet;
@@ -7,7 +9,7 @@ use std::env;
 use std::fs;
 use std::hash::{Hash, Hasher};
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
+use std::process::Command;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 thread_local! {
@@ -549,84 +551,21 @@ fn load_sqlite_history(
 }
 
 fn load_chromium_bookmarks(path: &Path) -> Result<Vec<Entry>, String> {
-    let script = r#"
-import json
-import sys
-
-path = sys.argv[1]
-
-with open(path, "r", encoding="utf-8") as fh:
-    data = json.load(fh)
-
-def clean(value):
-    return str(value or "").replace("\t", " ").replace("\n", " ")
-
-def walk(node, folder=""):
-    roots = node.get("roots", {})
-    if folder == "" and isinstance(roots, dict):
-        for child in roots.values():
-            walk(child, "")
-        return
-
-    children = node.get("children", [])
-    for child in children:
-        if child.get("type") == "url":
-            title = clean(child.get("name") or child.get("url"))
-            url = clean(child.get("url"))
-            if url:
-                print(f"{title}\t{url}\t{clean(folder)}")
-        elif child.get("type") == "folder":
-            name = clean(child.get("name"))
-            next_folder = name if not folder else (folder + "/" + name if name else folder)
-            walk(child, next_folder)
-
-walk(data, "")
-"#;
-    let output = run_python(script, &[path.to_string_lossy().to_string()])?;
-    Ok(parse_tsv_entries(
-        &output,
-        "bookmark",
-        path.file_name()
-            .and_then(|n| n.to_str())
-            .unwrap_or("Bookmarks"),
-    ))
+    let text = fs::read_to_string(path)
+        .map_err(|err| format!("read bookmarks {}: {err}", path.display()))?;
+    let data: JsonValue =
+        serde_json::from_str(&text).map_err(|err| format!("parse bookmarks JSON: {err}"))?;
+    let mut entries = Vec::new();
+    walk_chromium_bookmarks(&data, "", &mut entries);
+    Ok(entries)
 }
 
 fn load_safari_bookmarks(path: &Path) -> Result<Vec<Entry>, String> {
-    let script = r#"
-import plistlib
-import sys
-
-path = sys.argv[1]
-
-with open(path, "rb") as fh:
-    data = plistlib.load(fh)
-
-def clean(value):
-    return str(value or "").replace("\t", " ").replace("\n", " ")
-
-def walk(node, folder=""):
-    if isinstance(node, list):
-        for item in node:
-            walk(item, folder)
-        return
-    if isinstance(node, dict):
-        if node.get("URLString"):
-            title = clean(node.get("URIDictionary", {}).get("title") or node.get("Title") or node.get("URLString"))
-            url = clean(node.get("URLString"))
-            print(f"{title}\t{url}\t{clean(folder)}")
-        children = node.get("Children") or []
-        next_folder = folder
-        title = clean(node.get("Title"))
-        if title:
-            next_folder = title if not folder else folder + "/" + title
-        for child in children:
-            walk(child, next_folder)
-
-walk(data, "")
-"#;
-    let output = run_python(script, &[path.to_string_lossy().to_string()])?;
-    Ok(parse_tsv_entries(&output, "bookmark", "Safari"))
+    let data = PlistValue::from_file(path)
+        .map_err(|err| format!("parse safari bookmarks {}: {err}", path.display()))?;
+    let mut entries = Vec::new();
+    walk_safari_bookmarks(&data, "", &mut entries);
+    Ok(entries)
 }
 
 fn fetch_github_rows(url: &str, token: Option<&str>) -> Result<Vec<Entry>, String> {
@@ -645,20 +584,7 @@ fn fetch_github_rows(url: &str, token: Option<&str>) -> Result<Vec<Entry>, Strin
     }
 
     let output = command_output("curl", &with_url(args, url))?;
-    let script = r#"
-import json
-import sys
-
-data = json.loads(sys.stdin.read() or "[]")
-for item in data:
-    title = str(item.get("full_name") or item.get("name") or item.get("html_url") or "").replace("\t", " ").replace("\n", " ")
-    url = str(item.get("html_url") or "").replace("\t", " ").replace("\n", " ")
-    detail = str(item.get("description") or "").replace("\t", " ").replace("\n", " ")
-    if url:
-        print(f"{title}\t{url}\t{detail}")
-"#;
-    let parsed = run_python_stdin(script, &output, &[])?;
-    Ok(parse_tsv_entries(&parsed, "github", "GitHub"))
+    parse_github_entries(&output)
 }
 
 fn fetch_gitlab_rows(url: &str, token: Option<&str>) -> Result<Vec<Entry>, String> {
@@ -671,20 +597,153 @@ fn fetch_gitlab_rows(url: &str, token: Option<&str>) -> Result<Vec<Entry>, Strin
     }
 
     let output = command_output("curl", &with_url(args, url))?;
-    let script = r#"
-import json
-import sys
+    parse_gitlab_entries(&output)
+}
 
-data = json.loads(sys.stdin.read() or "[]")
-for item in data:
-    title = str(item.get("path_with_namespace") or item.get("name") or item.get("web_url") or "").replace("\t", " ").replace("\n", " ")
-    url = str(item.get("web_url") or "").replace("\t", " ").replace("\n", " ")
-    detail = str(item.get("description") or "").replace("\t", " ").replace("\n", " ")
-    if url:
-        print(f"{title}\t{url}\t{detail}")
-"#;
-    let parsed = run_python_stdin(script, &output, &[])?;
-    Ok(parse_tsv_entries(&parsed, "gitlab", "GitLab"))
+fn walk_chromium_bookmarks(node: &JsonValue, folder: &str, entries: &mut Vec<Entry>) {
+    if folder.is_empty() {
+        if let Some(roots) = node.get("roots").and_then(JsonValue::as_object) {
+            for child in roots.values() {
+                walk_chromium_bookmarks(child, "", entries);
+            }
+            return;
+        }
+    }
+
+    let Some(children) = node.get("children").and_then(JsonValue::as_array) else {
+        return;
+    };
+
+    for child in children {
+        match json_str(child.get("type")) {
+            Some("url") => {
+                let url = clean_json_str(child.get("url")).unwrap_or_default();
+                if url.is_empty() {
+                    continue;
+                }
+                let title = clean_json_str(child.get("name")).unwrap_or_else(|| url.clone());
+                entries.push(Entry::new(title, url, "bookmark", folder.to_string()));
+            }
+            Some("folder") => {
+                let name = clean_json_str(child.get("name")).unwrap_or_default();
+                let next_folder = if folder.is_empty() {
+                    name
+                } else if name.is_empty() {
+                    folder.to_string()
+                } else {
+                    format!("{folder}/{name}")
+                };
+                walk_chromium_bookmarks(child, &next_folder, entries);
+            }
+            _ => {}
+        }
+    }
+}
+
+fn walk_safari_bookmarks(node: &PlistValue, folder: &str, entries: &mut Vec<Entry>) {
+    if let Some(items) = node.as_array() {
+        for item in items {
+            walk_safari_bookmarks(item, folder, entries);
+        }
+        return;
+    }
+
+    let Some(dict) = node.as_dictionary() else {
+        return;
+    };
+
+    if let Some(url) = dict.get("URLString").and_then(PlistValue::as_string) {
+        let title = dict
+            .get("URIDictionary")
+            .and_then(PlistValue::as_dictionary)
+            .and_then(|dict| dict.get("title"))
+            .and_then(PlistValue::as_string)
+            .or_else(|| dict.get("Title").and_then(PlistValue::as_string))
+            .unwrap_or(url);
+        entries.push(Entry::new(
+            clean_text(title),
+            clean_text(url),
+            "bookmark",
+            clean_text(folder),
+        ));
+    }
+
+    let title = dict
+        .get("Title")
+        .and_then(PlistValue::as_string)
+        .map(clean_text)
+        .unwrap_or_default();
+    let next_folder = if title.is_empty() {
+        folder.to_string()
+    } else if folder.is_empty() {
+        title
+    } else {
+        format!("{folder}/{title}")
+    };
+
+    if let Some(children) = dict.get("Children").and_then(PlistValue::as_array) {
+        for child in children {
+            walk_safari_bookmarks(child, &next_folder, entries);
+        }
+    }
+}
+
+fn parse_github_entries(text: &str) -> Result<Vec<Entry>, String> {
+    let data: JsonValue = serde_json::from_str(if text.trim().is_empty() { "[]" } else { text })
+        .map_err(|err| format!("parse GitHub JSON: {err}"))?;
+    let Some(items) = data.as_array() else {
+        return Ok(Vec::new());
+    };
+
+    Ok(items
+        .iter()
+        .filter_map(|item| {
+            let url = clean_json_str(item.get("html_url"))?;
+            if url.is_empty() {
+                return None;
+            }
+            let title = clean_json_str(item.get("full_name"))
+                .or_else(|| clean_json_str(item.get("name")))
+                .unwrap_or_else(|| url.clone());
+            let detail = clean_json_str(item.get("description")).unwrap_or_default();
+            Some(Entry::new(title, url, "github", detail))
+        })
+        .collect())
+}
+
+fn parse_gitlab_entries(text: &str) -> Result<Vec<Entry>, String> {
+    let data: JsonValue = serde_json::from_str(if text.trim().is_empty() { "[]" } else { text })
+        .map_err(|err| format!("parse GitLab JSON: {err}"))?;
+    let Some(items) = data.as_array() else {
+        return Ok(Vec::new());
+    };
+
+    Ok(items
+        .iter()
+        .filter_map(|item| {
+            let url = clean_json_str(item.get("web_url"))?;
+            if url.is_empty() {
+                return None;
+            }
+            let title = clean_json_str(item.get("path_with_namespace"))
+                .or_else(|| clean_json_str(item.get("name")))
+                .unwrap_or_else(|| url.clone());
+            let detail = clean_json_str(item.get("description")).unwrap_or_default();
+            Some(Entry::new(title, url, "gitlab", detail))
+        })
+        .collect())
+}
+
+fn clean_json_str(value: Option<&JsonValue>) -> Option<String> {
+    json_str(value).map(clean_text)
+}
+
+fn json_str(value: Option<&JsonValue>) -> Option<&str> {
+    value.and_then(JsonValue::as_str)
+}
+
+fn clean_text(value: &str) -> String {
+    value.replace(['\t', '\n', '\r'], " ")
 }
 
 fn parse_tsv_entries(text: &str, source: &str, default_detail: &str) -> Vec<Entry> {
@@ -694,29 +753,6 @@ fn parse_tsv_entries(text: &str, source: &str, default_detail: &str) -> Vec<Entr
             let title = parts.next()?.trim();
             let url = parts.next()?.trim();
             let detail = parts.next().unwrap_or(default_detail).trim();
-            if url.is_empty() {
-                return None;
-            }
-            Some(Entry::new(
-                title.to_string(),
-                url.to_string(),
-                source.to_string(),
-                detail.to_string(),
-            ))
-        })
-        .collect()
-}
-
-// Parses 4-column TSV output from fetch_dockerhub_page:
-// title \t url \t source(public|private) \t detail
-fn parse_dockerhub_repo_entries(text: &str) -> Vec<Entry> {
-    text.lines()
-        .filter_map(|line| {
-            let mut parts = line.splitn(4, '\t');
-            let title = parts.next()?.trim();
-            let url = parts.next()?.trim();
-            let source = parts.next().unwrap_or("public").trim();
-            let detail = parts.next().unwrap_or("").trim();
             if url.is_empty() {
                 return None;
             }
@@ -785,38 +821,20 @@ pub fn fetch_dockerhub_tags(repo: &str, token: Option<&str>) -> Result<Vec<Strin
         return Ok(Vec::new());
     }
 
-    let script = r#"
-import json, sys
-data = json.loads(sys.stdin.read() or "{}")
-for item in (data.get("results") or []):
-    name = str(item.get("name") or "").strip()
-    if name:
-        print(name)
-"#;
-    let mut command = std::process::Command::new("python3");
-    command.arg("-c").arg(script);
-    let mut child = command
-        .stdin(std::process::Stdio::piped())
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::piped())
-        .spawn()
-        .map_err(|err| format!("failed to run python3: {err}"))?;
-    if let Some(mut stdin) = child.stdin.take() {
-        use std::io::Write;
-        stdin
-            .write_all(output.as_bytes())
-            .map_err(|err| format!("write python stdin: {err}"))?;
-    }
-    let result = child
-        .wait_with_output()
-        .map_err(|err| format!("collect python output: {err}"))?;
+    parse_dockerhub_tags(&output)
+}
 
-    let tags = String::from_utf8_lossy(&result.stdout)
-        .lines()
-        .filter(|l| !l.is_empty())
-        .map(|l| l.to_string())
-        .collect();
-    Ok(tags)
+fn parse_dockerhub_tags(text: &str) -> Result<Vec<String>, String> {
+    let data: JsonValue = serde_json::from_str(if text.trim().is_empty() { "{}" } else { text })
+        .map_err(|err| format!("parse DockerHub tags JSON: {err}"))?;
+    Ok(data
+        .get("results")
+        .and_then(JsonValue::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(|item| clean_json_str(item.get("name")))
+        .filter(|name| !name.is_empty())
+        .collect())
 }
 
 fn deduplicate(entries: Vec<Entry>) -> Vec<Entry> {
@@ -852,47 +870,6 @@ fn command_output_with_stderr(program: &str, args: &[&str]) -> Result<String, St
         .args(args)
         .output()
         .map_err(|err| format!("failed to run {program}: {err}"))?;
-    Ok(String::from_utf8_lossy(&output.stdout).into_owned())
-}
-
-fn run_python(script: &str, args: &[String]) -> Result<String, String> {
-    let mut command = Command::new("python3");
-    command.arg("-c").arg(script);
-    for arg in args {
-        command.arg(arg);
-    }
-    let output = command
-        .output()
-        .map_err(|err| format!("failed to run python3: {err}"))?;
-    if !output.status.success() {
-        return Ok(String::new());
-    }
-    Ok(String::from_utf8_lossy(&output.stdout).into_owned())
-}
-
-fn run_python_stdin(script: &str, stdin_input: &str, args: &[&str]) -> Result<String, String> {
-    let mut command = Command::new("python3");
-    command.arg("-c").arg(script);
-    for arg in args {
-        command.arg(arg);
-    }
-    let mut child = command
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .spawn()
-        .map_err(|err| format!("failed to run python3: {err}"))?;
-    if let Some(mut stdin) = child.stdin.take() {
-        use std::io::Write;
-        stdin
-            .write_all(stdin_input.as_bytes())
-            .map_err(|err| format!("failed to write python stdin: {err}"))?;
-    }
-    let output = child
-        .wait_with_output()
-        .map_err(|err| format!("failed to collect python output: {err}"))?;
-    if !output.status.success() {
-        return Ok(String::new());
-    }
     Ok(String::from_utf8_lossy(&output.stdout).into_owned())
 }
 
@@ -1010,66 +987,15 @@ pub fn fetch_dockerhub_page(config: &Config, page: usize) -> Result<Vec<Entry>, 
         return Ok(Vec::new());
     }
 
-    let script = r#"
-import json
-import sys
-
-raw = sys.stdin.read()
-try:
-    data = json.loads(raw or "{}")
-except Exception as e:
-    print(f"JSON_PARSE_ERROR: {e}", file=sys.stderr)
-    sys.exit(0)
-
-if "message" in data or "detail" in data:
-    msg = data.get("message") or data.get("detail") or ""
-    print(f"API_ERROR: {msg}", file=sys.stderr)
-
-results = data.get("results") or []
-for item in results:
-    namespace = str(item.get("namespace") or "").replace("\t", " ").replace("\n", " ")
-    name = str(item.get("name") or "").replace("\t", " ").replace("\n", " ")
-    description = str(item.get("description") or "").replace("\t", " ").replace("\n", " ")
-    is_private = item.get("is_private", False)
-    source = "private" if is_private else "public"
-    title = f"{namespace}/{name}" if namespace else name
-    url = f"https://hub.docker.com/r/{namespace}/{name}" if namespace else f"https://hub.docker.com/r/{name}"
-    if title:
-        print(f"{title}\t{url}\t{source}\t{description}")
-"#;
-
-    let mut command = std::process::Command::new("python3");
-    command.arg("-c").arg(script);
-    let mut child = command
-        .stdin(std::process::Stdio::piped())
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::piped())
-        .spawn()
-        .map_err(|err| format!("failed to run python3: {err}"))?;
-    if let Some(mut stdin) = child.stdin.take() {
-        use std::io::Write;
-        stdin
-            .write_all(output.as_bytes())
-            .map_err(|err| format!("failed to write python stdin: {err}"))?;
-    }
-    let result = child
-        .wait_with_output()
-        .map_err(|err| format!("failed to collect python output: {err}"))?;
-
+    let entries_without_tags = parse_dockerhub_repo_entries(&output, config.debug)?;
     if config.debug {
-        let stderr_out = String::from_utf8_lossy(&result.stderr);
-        if !stderr_out.trim().is_empty() {
-            eprintln!("[dockerhub] python stderr: {stderr_out}");
-        }
-        let stdout_out = String::from_utf8_lossy(&result.stdout);
         eprintln!(
-            "[dockerhub] python parsed {} lines",
-            stdout_out.lines().count()
+            "[dockerhub] parsed {} repository entries",
+            entries_without_tags.len()
         );
     }
 
-    let parsed = String::from_utf8_lossy(&result.stdout).into_owned();
-    let entries: Vec<Entry> = parse_dockerhub_repo_entries(&parsed)
+    let entries: Vec<Entry> = entries_without_tags
         .into_iter()
         .map(|entry| with_dockerhub_tags(entry, config.dockerhub_token.as_deref()))
         .collect();
@@ -1079,6 +1005,47 @@ for item in results:
     }
 
     Ok(entries)
+}
+
+fn parse_dockerhub_repo_entries(text: &str, debug: bool) -> Result<Vec<Entry>, String> {
+    let data: JsonValue = serde_json::from_str(if text.trim().is_empty() { "{}" } else { text })
+        .map_err(|err| format!("parse DockerHub JSON: {err}"))?;
+
+    if debug {
+        let message = clean_json_str(data.get("message"))
+            .or_else(|| clean_json_str(data.get("detail")))
+            .unwrap_or_default();
+        if !message.is_empty() {
+            eprintln!("[dockerhub] API_ERROR: {message}");
+        }
+    }
+
+    Ok(data
+        .get("results")
+        .and_then(JsonValue::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(|item| {
+            let namespace = clean_json_str(item.get("namespace")).unwrap_or_default();
+            let name = clean_json_str(item.get("name")).unwrap_or_default();
+            if name.is_empty() {
+                return None;
+            }
+            let description = clean_json_str(item.get("description")).unwrap_or_default();
+            let is_private = item
+                .get("is_private")
+                .and_then(JsonValue::as_bool)
+                .unwrap_or(false);
+            let source = if is_private { "private" } else { "public" };
+            let title = if namespace.is_empty() {
+                name.clone()
+            } else {
+                format!("{namespace}/{name}")
+            };
+            let url = format!("https://hub.docker.com/r/{title}");
+            Some(Entry::new(title, url, source, description))
+        })
+        .collect())
 }
 
 #[cfg(test)]

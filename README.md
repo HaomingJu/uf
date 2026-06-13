@@ -18,7 +18,6 @@ Search uses `nucleo-matcher` for fuzzy matching. The UI keeps precomputed search
 ## Runtime requirements
 
 - Rust toolchain
-- `python3`
 - `sqlite3`
 - `curl`
 - `stty`
@@ -127,8 +126,8 @@ For DockerHub specifically, the log covers every step of the fetch pipeline:
 | `[dockerhub] token: present` / `none (public repos only)` | Whether a token was supplied |
 | `[dockerhub] curl response (N bytes): ...` | First 500 bytes of the raw API response |
 | `[dockerhub] curl returned empty body` | curl returned nothing — likely a network or auth failure |
-| `[dockerhub] python stderr: API_ERROR: ...` | Error message returned by the DockerHub API |
-| `[dockerhub] python parsed N lines` | Number of rows the parser extracted |
+| `[dockerhub] API_ERROR: ...` | Error message returned by the DockerHub API |
+| `[dockerhub] parsed N repository entries` | Number of rows extracted from the API response |
 | `[dockerhub] page N: N entries` | Final entry count for the page |
 
 Example showing a token auth problem:
