@@ -26,7 +26,7 @@ This repository contains a Rust terminal search tool that launches browser URLs 
 ## Entry points
 
 - CLI: `cargo run --release`
-- Installed command: `web-fzf`
+- Installed command: `uf`
 
 ## Verification
 

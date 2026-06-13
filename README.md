@@ -1,4 +1,4 @@
-# web-fzf
+# uf
 
 Terminal search launcher for browser history, bookmarks, GitHub, GitLab, and DockerHub.
 
@@ -33,7 +33,7 @@ cargo run --release
 Or after installation:
 
 ```bash
-web-fzf
+uf
 ```
 
 ## Controls
@@ -109,7 +109,7 @@ Press `Ctrl+F` to request an immediate refresh for the current tab. If that tab 
 Use `--debug` to write diagnostic logs to stderr. Redirect stderr to a file so the output does not interfere with the TUI:
 
 ```bash
-web-fzf --debug 2>debug.log
+uf --debug 2>debug.log
 ```
 
 Open the app as usual, then quit. Inspect the log:
@@ -134,7 +134,7 @@ For DockerHub specifically, the log covers every step of the fetch pipeline:
 Example showing a token auth problem:
 
 ```bash
-DOCKERHUB_USERNAME=myuser web-fzf --debug 2>debug.log
+DOCKERHUB_USERNAME=myuser uf --debug 2>debug.log
 # quit the app, then:
 grep dockerhub debug.log
 # [dockerhub] GET https://hub.docker.com/v2/repositories/myuser/...

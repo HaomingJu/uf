@@ -148,8 +148,8 @@ where
 
 fn print_help() {
     println!(
-        "web-fzf\n\n\
-Usage: web-fzf [options]\n\n\
+        "uf\n\n\
+Usage: uf [options]\n\n\
 Options:\n\
   --no-browser\n\
   --no-github\n\

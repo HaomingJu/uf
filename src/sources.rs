@@ -574,7 +574,7 @@ fn fetch_github_rows(url: &str, token: Option<&str>) -> Result<Vec<Entry>, Strin
         "-H",
         "Accept: application/vnd.github+json",
         "-H",
-        "User-Agent: web-fzf",
+        "User-Agent: uf",
     ];
     let auth_header;
     if let Some(token) = token {
@@ -919,7 +919,7 @@ fn remote_cache_path(source: &str) -> Option<PathBuf> {
     let base = env::var_os("XDG_CACHE_HOME")
         .map(PathBuf::from)
         .or_else(|| home_dir().map(|home| home.join(".cache")))?;
-    Some(base.join("web-fzf").join(format!("{source}.json")))
+    Some(base.join("uf").join(format!("{source}.json")))
 }
 
 fn remote_cache_age(source: &str) -> Option<Duration> {
@@ -959,7 +959,7 @@ fn copy_sqlite_to_temp(db_path: &Path) -> Result<PathBuf, String> {
         .duration_since(UNIX_EPOCH)
         .map(|duration| duration.as_nanos())
         .unwrap_or_default();
-    let filename = format!("web-fzf-{}-{}.sqlite", std::process::id(), suffix);
+    let filename = format!("uf-{}-{}.sqlite", std::process::id(), suffix);
     temp_path.push(filename);
     fs::copy(db_path, &temp_path)
         .map_err(|err| format!("copy sqlite db {}: {err}", db_path.display()))?;

@@ -1,4 +1,4 @@
-use web_fzf::matchers::fuzzy_score;
+use uf::matchers::fuzzy_score;
 
 #[test]
 fn fuzzy_score_matches_subsequence() {

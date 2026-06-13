@@ -1,5 +1,5 @@
-use web_fzf::models::Entry;
-use web_fzf::ui::best_entry;
+use uf::models::Entry;
+use uf::ui::best_entry;
 
 #[test]
 fn best_entry_prefers_tighter_match() {

@@ -807,7 +807,7 @@ fn render_header(frame: &mut Frame<'_>, area: Rect, app: &AppState) {
 
     let title = Line::from(vec![
         Span::styled(
-            " web-fzf ",
+            " uf ",
             Style::default()
                 .fg(Color::Cyan)
                 .add_modifier(Modifier::BOLD),
