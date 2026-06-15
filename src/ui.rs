@@ -521,7 +521,9 @@ fn move_selection_up(app: &mut AppState) {
 
 fn move_selection_down(app: &mut AppState) {
     let repo_source = if matches!(app.mode, AppMode::RepoMenu { .. }) {
-        app.selected_entry().map(|e| e.source.clone()).unwrap_or_default()
+        app.selected_entry()
+            .map(|e| e.source.clone())
+            .unwrap_or_default()
     } else {
         String::new()
     };
@@ -574,7 +576,9 @@ fn page_selection_up(app: &mut AppState) {
 
 fn page_selection_down(app: &mut AppState) {
     let repo_source = if matches!(app.mode, AppMode::RepoMenu { .. }) {
-        app.selected_entry().map(|e| e.source.clone()).unwrap_or_default()
+        app.selected_entry()
+            .map(|e| e.source.clone())
+            .unwrap_or_default()
     } else {
         String::new()
     };
@@ -693,11 +697,7 @@ fn confirm_docker_action(app: &mut AppState) {
     }
 }
 
-const REPO_ACTION_LABELS: [&str; 3] = [
-    "Open in browser",
-    "Copy HTTPS address",
-    "Copy SSH address",
-];
+const REPO_ACTION_LABELS: [&str; 3] = ["Open in browser", "Copy HTTPS address", "Copy SSH address"];
 
 const GITHUB_ACTION_LABELS: [&str; 4] = [
     "Open in browser",

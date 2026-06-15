@@ -67,7 +67,10 @@ pub fn run() -> Result<(), String> {
     let (dockerhub_entries, dockerhub_needs_refresh) = dockerhub_handle.join().unwrap_or_default();
 
     let mut entries = Vec::with_capacity(
-        browser_entries.len() + github_entries.len() + gitlab_entries.len() + dockerhub_entries.len(),
+        browser_entries.len()
+            + github_entries.len()
+            + gitlab_entries.len()
+            + dockerhub_entries.len(),
     );
     entries.extend(browser_entries);
     entries.extend(github_entries);

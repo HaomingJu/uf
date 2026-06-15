@@ -434,6 +434,7 @@ fn load_firefox_family() -> Result<Vec<Entry>, String> {
 
 fn load_safari() -> Result<Vec<Entry>, String> {
     let mut entries = Vec::new();
+    let mut macos_permission_denied = false;
     let Some(home) = home_dir() else {
         return Ok(entries);
     };
@@ -442,6 +443,9 @@ fn load_safari() -> Result<Vec<Entry>, String> {
     if bookmarks.exists() {
         match load_safari_bookmarks(&bookmarks) {
             Ok(mut rows) => entries.append(&mut rows),
+            Err(err) if is_macos_permission_denied_message(&err) => {
+                macos_permission_denied = true;
+            }
             Err(err) => source_log(format!("safari bookmarks {}: {err}", bookmarks.display())),
         }
     }
@@ -455,8 +459,18 @@ fn load_safari() -> Result<Vec<Entry>, String> {
             "Safari",
         ) {
             Ok(mut rows) => entries.append(&mut rows),
+            Err(err) if is_macos_permission_denied_message(&err) => {
+                macos_permission_denied = true;
+            }
             Err(err) => source_log(format!("safari history {}: {err}", history.display())),
         }
+    }
+
+    if macos_permission_denied {
+        source_log(
+            "safari data unavailable: macOS denied access. Grant Full Disk Access to your terminal to include Safari bookmarks and history."
+                .to_string(),
+        );
     }
 
     Ok(entries)
@@ -468,6 +482,12 @@ fn source_log(message: String) {
             eprintln!("{message}");
         }
     });
+}
+
+fn is_macos_permission_denied_message(message: &str) -> bool {
+    message.contains("Operation not permitted")
+        || message.contains("PermissionDenied")
+        || message.to_ascii_lowercase().contains("permission denied")
 }
 
 fn chromium_history_paths() -> Vec<PathBuf> {
@@ -1105,7 +1125,7 @@ fn parse_dockerhub_repo_entries(text: &str, debug: bool) -> Result<Vec<Entry>, S
 mod tests {
     use super::{
         clean_title, deduplicate, dockerhub_detail_with_tags, dockerhub_entry_description,
-        dockerhub_entry_tags, parse_tsv_entries,
+        dockerhub_entry_tags, is_macos_permission_denied_message, parse_tsv_entries,
     };
     use crate::models::Entry;
 
@@ -1121,6 +1141,16 @@ mod tests {
     fn clean_title_strips_leading_whitespace_and_format_chars() {
         let title = clean_title("\u{200F}\u{200D}   目开发代码合入记录 - 飞书云文档");
         assert_eq!(title, "目开发代码合入记录 - 飞书云文档");
+    }
+
+    #[test]
+    fn detects_macos_privacy_permission_errors() {
+        assert!(is_macos_permission_denied_message(
+            "Io(Os { code: 1, kind: PermissionDenied, message: \"Operation not permitted\" })"
+        ));
+        assert!(is_macos_permission_denied_message(
+            "copy sqlite db /Users/me/Library/Safari/History.db: Operation not permitted (os error 1)"
+        ));
     }
 
     #[test]
