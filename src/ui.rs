@@ -321,6 +321,7 @@ enum Action {
     JumpBottom,
     PreviousTab,
     NextTab,
+    ToggleConfigTab,
     RefreshCurrentTab,
     Backspace,
     InsertChar(char),
@@ -348,6 +349,7 @@ fn resolve_normal_action(key: InputKey) -> Option<Action> {
         InputCode::Char('u') if key.ctrl => Some(Action::PageUp),
         InputCode::Char('d') if key.ctrl => Some(Action::PageDown),
         InputCode::Char('r') if key.ctrl => Some(Action::RefreshCurrentTab),
+        InputCode::Char('b') if key.ctrl => Some(Action::ToggleConfigTab),
         InputCode::Char('j') | InputCode::Char('n') if key.ctrl => Some(Action::MoveDown),
         InputCode::Char('k') | InputCode::Char('p') if key.ctrl => Some(Action::MoveUp),
         InputCode::Char('h') if key.ctrl => Some(Action::PreviousTab),
@@ -447,10 +449,14 @@ fn apply_action(
             app.mode = AppMode::Normal;
             app.next_tab();
         }
+        Action::ToggleConfigTab => app.toggle_config_tab(),
         Action::RefreshCurrentTab => {
-            let request = app.tab.refresh_request();
-            let _ = refresh_requests.send(request);
-            app.message = format!("Requested {} refresh.", app.tab.name());
+            if let Some(request) = app.tab.refresh_request() {
+                let _ = refresh_requests.send(request);
+                app.message = format!("Requested {} refresh.", app.tab.name());
+            } else {
+                app.message = format!("{} tab has no refresh.", app.tab.name());
+            }
         }
         Action::Backspace => app.backspace(),
         Action::InsertChar(ch) => app.push_char(ch),
@@ -826,7 +832,9 @@ fn render(frame: &mut Frame<'_>, app: &mut AppState) {
             }
         }
         AppModeKind::Normal => {
-            if preview_enabled() {
+            if app.tab == Tab::Config {
+                render_config(frame, layout[2]);
+            } else if preview_enabled() {
                 let body =
                     Layout::horizontal([Constraint::Percentage(62), Constraint::Percentage(38)])
                         .split(layout[2]);
@@ -877,35 +885,18 @@ fn render_header(frame: &mut Frame<'_>, area: Rect, app: &AppState) {
         header[0],
     );
 
-    let tabs = vec![
-        tab_label(
-            "History",
-            app.entries.iter().filter(|e| is_browser_entry(e)).count(),
-            Color::Green,
-        ),
-        tab_label(
-            "GitHub",
-            app.entries.iter().filter(|e| e.source == "github").count(),
-            Color::Magenta,
-        ),
-        tab_label(
-            "GitLab",
-            app.entries.iter().filter(|e| e.source == "gitlab").count(),
-            Color::Yellow,
-        ),
-        tab_label(
-            "DockerHub",
-            tab_count(&app.entries, Tab::DockerHub),
-            Color::Blue,
-        ),
-    ];
+    let tabs: Vec<Line<'static>> = app
+        .visible_tabs()
+        .iter()
+        .map(|tab| tab_label_for(*tab, &app.entries))
+        .collect();
 
     let selected_style = Style::default()
         .fg(Color::Black)
         .bg(Color::Cyan)
         .add_modifier(Modifier::BOLD);
     let tabs_widget = Tabs::new(tabs)
-        .select(app.tab.index())
+        .select(app.selected_tab_index())
         .block(
             Block::default()
                 .borders(Borders::NONE)
@@ -1155,10 +1146,12 @@ fn render_footer(frame: &mut Frame<'_>, area: Rect, app: &AppState) {
             "Up/Down=move  Ctrl+U/D=page  Enter=confirm  Backspace=back"
         }
         AppMode::Normal => {
-            if app.query.is_empty() {
-                "Enter=open  Ctrl+U/D=page  Ctrl+R=refresh tab  Esc=quit"
+            if app.tab == Tab::Config {
+                "Left/Right=switch tab  Ctrl+B=hide Config  Esc=quit"
+            } else if app.query.is_empty() {
+                "Enter=open  Ctrl+U/D=page  Ctrl+R=refresh tab  Ctrl+B=toggle Config  Esc=quit"
             } else {
-                "Type=fuzzy filter  Ctrl+U/D=page  Enter=open  Esc=quit"
+                "Type=fuzzy filter  Ctrl+U/D=page  Enter=open  Ctrl+B=toggle Config  Esc=quit"
             }
         }
     };
@@ -1270,6 +1263,20 @@ fn render_action_menu(
     frame.render_stateful_widget(list, area, &mut state);
 }
 
+fn render_config(frame: &mut Frame<'_>, area: Rect) {
+    let block = Block::default()
+        .title(Span::styled(
+            " Config ",
+            Style::default()
+                .fg(Color::Cyan)
+                .add_modifier(Modifier::BOLD),
+        ))
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(Color::DarkGray));
+
+    frame.render_widget(Paragraph::new("").block(block), area);
+}
+
 fn source_color(source: &str) -> Color {
     match source {
         "github" => Color::Magenta,
@@ -1304,6 +1311,28 @@ fn tab_label(name: &str, count: usize, color: Color) -> Line<'static> {
     ])
 }
 
+fn tab_label_for(tab: Tab, entries: &[Entry]) -> Line<'static> {
+    match tab {
+        Tab::History => tab_label(
+            "History",
+            entries.iter().filter(|e| is_browser_entry(e)).count(),
+            Color::Green,
+        ),
+        Tab::GitHub => tab_label(
+            "GitHub",
+            entries.iter().filter(|e| e.source == "github").count(),
+            Color::Magenta,
+        ),
+        Tab::GitLab => tab_label(
+            "GitLab",
+            entries.iter().filter(|e| e.source == "gitlab").count(),
+            Color::Yellow,
+        ),
+        Tab::DockerHub => tab_label("DockerHub", tab_count(entries, Tab::DockerHub), Color::Blue),
+        Tab::Config => tab_label("Config", 0, Color::Cyan),
+    }
+}
+
 fn tab_count(entries: &[Entry], tab: Tab) -> usize {
     entries.iter().filter(|entry| tab.matches(entry)).count()
 }
@@ -1314,51 +1343,36 @@ enum Tab {
     GitHub,
     GitLab,
     DockerHub,
+    Config,
 }
 
+const DEFAULT_TABS: [Tab; 4] = [Tab::History, Tab::GitHub, Tab::GitLab, Tab::DockerHub];
+const CONFIG_TABS: [Tab; 5] = [
+    Tab::History,
+    Tab::GitHub,
+    Tab::GitLab,
+    Tab::DockerHub,
+    Tab::Config,
+];
+
 impl Tab {
-    fn index(self) -> usize {
-        match self {
-            Tab::History => 0,
-            Tab::GitHub => 1,
-            Tab::GitLab => 2,
-            Tab::DockerHub => 3,
-        }
-    }
-
-    fn next(self) -> Self {
-        match self {
-            Tab::History => Tab::GitHub,
-            Tab::GitHub => Tab::GitLab,
-            Tab::GitLab => Tab::DockerHub,
-            Tab::DockerHub => Tab::History,
-        }
-    }
-
-    fn previous(self) -> Self {
-        match self {
-            Tab::History => Tab::DockerHub,
-            Tab::GitHub => Tab::History,
-            Tab::GitLab => Tab::GitHub,
-            Tab::DockerHub => Tab::GitLab,
-        }
-    }
-
     fn matches(self, entry: &Entry) -> bool {
         match self {
             Tab::History => is_browser_entry(entry),
             Tab::GitHub => entry.source == "github",
             Tab::GitLab => entry.source == "gitlab",
             Tab::DockerHub => entry.source == "public" || entry.source == "private",
+            Tab::Config => false,
         }
     }
 
-    fn refresh_request(self) -> RefreshRequest {
+    fn refresh_request(self) -> Option<RefreshRequest> {
         match self {
-            Tab::History => RefreshRequest::History,
-            Tab::GitHub => RefreshRequest::GitHub,
-            Tab::GitLab => RefreshRequest::GitLab,
-            Tab::DockerHub => RefreshRequest::DockerHub,
+            Tab::History => Some(RefreshRequest::History),
+            Tab::GitHub => Some(RefreshRequest::GitHub),
+            Tab::GitLab => Some(RefreshRequest::GitLab),
+            Tab::DockerHub => Some(RefreshRequest::DockerHub),
+            Tab::Config => None,
         }
     }
 
@@ -1368,6 +1382,7 @@ impl Tab {
             Tab::GitHub => "GitHub",
             Tab::GitLab => "GitLab",
             Tab::DockerHub => "DockerHub",
+            Tab::Config => "Config",
         }
     }
 }
@@ -1501,6 +1516,7 @@ struct AppState {
     result_viewport_height: usize,
     message: String,
     tab: Tab,
+    config_tab_visible: bool,
     cursor_visible: bool,
     mode: AppMode,
     dirty: bool,
@@ -1555,6 +1571,7 @@ impl AppState {
             result_viewport_height: 0,
             message: "Type to search.".to_string(),
             tab: Tab::History,
+            config_tab_visible: false,
             cursor_visible: true,
             mode: AppMode::Normal,
             dirty: false,
@@ -1585,6 +1602,21 @@ impl AppState {
         self.visible
             .get(self.selected)
             .and_then(|idx| self.entries.get(*idx))
+    }
+
+    fn visible_tabs(&self) -> &'static [Tab] {
+        if self.config_tab_visible {
+            &CONFIG_TABS
+        } else {
+            &DEFAULT_TABS
+        }
+    }
+
+    fn selected_tab_index(&self) -> usize {
+        self.visible_tabs()
+            .iter()
+            .position(|tab| *tab == self.tab)
+            .unwrap_or(0)
     }
 
     fn set_result_viewport_height(&mut self, height: usize) {
@@ -1698,14 +1730,35 @@ impl AppState {
     }
 
     fn next_tab(&mut self) {
-        self.tab = self.tab.next();
+        let tabs = self.visible_tabs();
+        let current = self.selected_tab_index();
+        self.tab = tabs[(current + 1) % tabs.len()];
         self.selected = 0;
         self.scroll_start = 0;
         self.recompute();
     }
 
     fn previous_tab(&mut self) {
-        self.tab = self.tab.previous();
+        let tabs = self.visible_tabs();
+        let current = self.selected_tab_index();
+        self.tab = tabs[(current + tabs.len() - 1) % tabs.len()];
+        self.selected = 0;
+        self.scroll_start = 0;
+        self.recompute();
+    }
+
+    fn toggle_config_tab(&mut self) {
+        self.config_tab_visible = !self.config_tab_visible;
+        self.mode = AppMode::Normal;
+        if self.config_tab_visible {
+            self.tab = Tab::Config;
+            self.message = "Config tab shown.".to_string();
+        } else {
+            if self.tab == Tab::Config {
+                self.tab = Tab::History;
+            }
+            self.message = "Config tab hidden.".to_string();
+        }
         self.selected = 0;
         self.scroll_start = 0;
         self.recompute();
@@ -1985,6 +2038,10 @@ mod tests {
             resolve_action(AppModeKind::Normal, InputKey::ctrl('j')),
             Some(Action::MoveDown)
         );
+        assert_eq!(
+            resolve_action(AppModeKind::Normal, InputKey::ctrl('b')),
+            Some(Action::ToggleConfigTab)
+        );
     }
 
     #[test]
@@ -2053,6 +2110,51 @@ mod tests {
             resolve_action(AppModeKind::ActionMenu, InputKey::new(InputCode::Backspace)),
             Some(Action::BackToTags)
         );
+    }
+
+    #[test]
+    fn config_tab_is_hidden_until_toggled() {
+        let mut app = AppState::new(Vec::new());
+        assert_eq!(
+            app.visible_tabs(),
+            &[Tab::History, Tab::GitHub, Tab::GitLab, Tab::DockerHub]
+        );
+        assert_eq!(app.tab, Tab::History);
+
+        app.toggle_config_tab();
+        assert_eq!(
+            app.visible_tabs(),
+            &[
+                Tab::History,
+                Tab::GitHub,
+                Tab::GitLab,
+                Tab::DockerHub,
+                Tab::Config,
+            ]
+        );
+        assert_eq!(app.tab, Tab::Config);
+        assert_eq!(app.selected_tab_index(), 4);
+        assert!(app.visible.is_empty());
+
+        app.toggle_config_tab();
+        assert_eq!(
+            app.visible_tabs(),
+            &[Tab::History, Tab::GitHub, Tab::GitLab, Tab::DockerHub]
+        );
+        assert_eq!(app.tab, Tab::History);
+    }
+
+    #[test]
+    fn tab_navigation_includes_config_only_when_visible() {
+        let mut app = AppState::new(Vec::new());
+        app.previous_tab();
+        assert_eq!(app.tab, Tab::DockerHub);
+
+        app.toggle_config_tab();
+        app.previous_tab();
+        assert_eq!(app.tab, Tab::DockerHub);
+        app.next_tab();
+        assert_eq!(app.tab, Tab::Config);
     }
 
     #[test]
