@@ -1,3 +1,4 @@
+use crate::config::{parse_refresh_interval, Config, RuntimeConfig};
 use crate::matchers::FuzzyMatcher;
 use crate::models::Entry;
 use crate::sources::{dockerhub_entry_description, dockerhub_entry_tags};
@@ -11,6 +12,7 @@ use std::cmp::Ordering;
 use std::io::{self, IsTerminal, Read};
 use std::process::Command;
 use std::sync::mpsc::{Receiver, Sender, TryRecvError};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use unicode_segmentation::UnicodeSegmentation;
 use unicode_width::UnicodeWidthStr;
@@ -38,6 +40,9 @@ pub enum RefreshRequest {
 
 pub fn run_ui(
     entries: Vec<Entry>,
+    config: Config,
+    runtime_config: RuntimeConfig,
+    shared_config: Arc<Mutex<Config>>,
     events: Receiver<UiEvent>,
     refresh_requests: Sender<RefreshRequest>,
 ) -> Result<(), String> {
@@ -46,7 +51,7 @@ pub fn run_ui(
     }
 
     let mut session = TerminalSession::enter()?;
-    let mut app = AppState::new(entries);
+    let mut app = AppState::new(entries, config, runtime_config, shared_config);
     let mut terminal = Terminal::new(CrosstermBackend::new(io::stdout()))
         .map_err(|err| format!("create terminal: {err}"))?;
     let mut last_cursor_toggle = Instant::now();
@@ -307,6 +312,7 @@ enum AppModeKind {
     TagList,
     ActionMenu,
     RepoMenu,
+    ConfigEdit,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -330,6 +336,8 @@ enum Action {
     BackToTags,
     ConfirmDockerAction,
     ConfirmRepoAction,
+    CommitConfigEdit,
+    CancelConfigEdit,
 }
 
 fn resolve_action(mode: AppModeKind, key: InputKey) -> Option<Action> {
@@ -338,6 +346,7 @@ fn resolve_action(mode: AppModeKind, key: InputKey) -> Option<Action> {
         AppModeKind::TagList => resolve_tag_list_action(key),
         AppModeKind::ActionMenu => resolve_action_menu_action(key),
         AppModeKind::RepoMenu => resolve_repo_menu_action(key),
+        AppModeKind::ConfigEdit => resolve_config_edit_action(key),
     }
 }
 
@@ -427,6 +436,16 @@ fn resolve_repo_menu_action(key: InputKey) -> Option<Action> {
     }
 }
 
+fn resolve_config_edit_action(key: InputKey) -> Option<Action> {
+    match key.code {
+        InputCode::Esc => Some(Action::CancelConfigEdit),
+        InputCode::Enter => Some(Action::CommitConfigEdit),
+        InputCode::Backspace => Some(Action::Backspace),
+        InputCode::Char(c) if !key.ctrl => Some(Action::InsertChar(c)),
+        _ => None,
+    }
+}
+
 fn apply_action(
     app: &mut AppState,
     action: Action,
@@ -434,6 +453,7 @@ fn apply_action(
 ) -> Result<bool, String> {
     match action {
         Action::Quit => return Ok(true),
+        Action::OpenSelected if app.tab == Tab::Config => start_config_edit(app),
         Action::OpenSelected => open_selected_entry(app)?,
         Action::MoveUp => move_selection_up(app),
         Action::MoveDown => move_selection_down(app),
@@ -458,7 +478,13 @@ fn apply_action(
                 app.message = format!("{} tab has no refresh.", app.tab.name());
             }
         }
+        Action::Backspace if matches!(app.mode, AppMode::ConfigEdit { .. }) => {
+            app.pop_config_edit_char()
+        }
         Action::Backspace => app.backspace(),
+        Action::InsertChar(ch) if matches!(app.mode, AppMode::ConfigEdit { .. }) => {
+            app.push_config_edit_char(ch)
+        }
         Action::InsertChar(ch) => app.push_char(ch),
         Action::BackToNormal => {
             app.mode = AppMode::Normal;
@@ -468,6 +494,8 @@ fn apply_action(
         Action::BackToTags => back_to_docker_tags(app),
         Action::ConfirmDockerAction => confirm_docker_action(app),
         Action::ConfirmRepoAction => confirm_repo_action(app)?,
+        Action::CommitConfigEdit => commit_config_edit(app),
+        Action::CancelConfigEdit => cancel_config_edit(app),
     }
     Ok(false)
 }
@@ -506,8 +534,169 @@ fn open_selected_entry(app: &mut AppState) -> Result<(), String> {
     Ok(())
 }
 
+fn start_config_edit(app: &mut AppState) {
+    let Some(item_index) = app.selected_config_item_index() else {
+        app.message = "Select an indented config item to edit.".to_string();
+        return;
+    };
+    let edit_kind = app.config_items[item_index].edit_kind;
+    match edit_kind {
+        ConfigEditKind::Toggle => {
+            let (level1, level2, level3, enabled) = {
+                let item = &app.config_items[item_index];
+                (
+                    item.level1.clone(),
+                    item.level2.clone(),
+                    item.level3.clone(),
+                    item.current != "enabled",
+                )
+            };
+            if let Err(err) = apply_config_toggle(app, &level1, &level2, &level3, enabled) {
+                app.message = err;
+                return;
+            }
+            app.message = format!("Updated {} / {} / {}.", level1, level2, level3);
+            app.recompute();
+        }
+        ConfigEditKind::Text => {
+            let current = app.config_items[item_index].current.clone();
+            let buffer = if current == "not set" {
+                String::new()
+            } else {
+                current
+            };
+            app.mode = AppMode::ConfigEdit { item_index, buffer };
+        }
+        ConfigEditKind::Secret => {
+            app.mode = AppMode::ConfigEdit {
+                item_index,
+                buffer: String::new(),
+            };
+            app.message = "Enter a token value; it will only be shown as present.".to_string();
+        }
+        ConfigEditKind::ReadOnly => {
+            app.message = "This config item is informational.".to_string();
+        }
+    }
+}
+
+fn commit_config_edit(app: &mut AppState) {
+    let AppMode::ConfigEdit { item_index, buffer } = &app.mode else {
+        return;
+    };
+    let item_index = *item_index;
+    let buffer = buffer.trim().to_string();
+    let Some(item) = app.config_items.get(item_index) else {
+        app.mode = AppMode::Normal;
+        return;
+    };
+    let level1 = item.level1.clone();
+    let level2 = item.level2.clone();
+    let level3 = item.level3.clone();
+    let edit_kind = item.edit_kind;
+
+    let result = match edit_kind {
+        ConfigEditKind::Text | ConfigEditKind::Secret => {
+            apply_config_value(app, &level1, &level2, &level3, &buffer)
+        }
+        ConfigEditKind::Toggle | ConfigEditKind::ReadOnly => Ok(()),
+    };
+    if let Err(err) = result {
+        app.message = err;
+        return;
+    }
+    app.message = format!("Updated {} / {} / {}.", level1, level2, level3);
+    app.mode = AppMode::Normal;
+}
+
+fn apply_config_toggle(
+    app: &mut AppState,
+    level1: &str,
+    level2: &str,
+    level3: &str,
+    enabled: bool,
+) -> Result<(), String> {
+    match (level1, level2, level3) {
+        ("Browser", "Source", "Enabled")
+        | ("GitHub", "Source", "Enabled")
+        | ("GitLab", "Source", "Enabled")
+        | ("DockerHub", "Source", "Enabled") => app.set_source_enabled(level1, enabled),
+        ("System", "Display", "Preview pane") => app.config.preview_enabled = enabled,
+        ("System", "Diagnostics", "Debug logging") => app.config.debug = enabled,
+        _ => {}
+    }
+    app.sync_config_items();
+    app.persist_config()
+}
+
+fn apply_config_value(
+    app: &mut AppState,
+    level1: &str,
+    level2: &str,
+    level3: &str,
+    value: &str,
+) -> Result<(), String> {
+    match (level1, level2, level3) {
+        ("GitHub", "Auth", "Token") => {
+            app.config.github_token = optional_config_value(value);
+        }
+        ("GitHub", "Auth", "User") => {
+            app.config.github_user = optional_config_value(value);
+        }
+        ("GitLab", "Auth", "Token") => {
+            app.config.gitlab_token = optional_config_value(value);
+        }
+        ("DockerHub", "Auth", "Token") => {
+            app.config.dockerhub_token = optional_config_value(value);
+        }
+        ("DockerHub", "Auth", "Username") => {
+            app.config.dockerhub_username = optional_config_value(value);
+        }
+        ("GitHub", "API", "Base URL") => {
+            app.config.github_api = value.trim().to_string();
+        }
+        ("GitLab", "API", "Base URL") => {
+            app.config.gitlab_api = value.trim().to_string();
+        }
+        ("Browser", "Refresh", "Interval") => {
+            app.config.history_refresh_interval = parse_refresh_interval(value)
+                .ok_or_else(|| "Invalid browser refresh interval.".to_string())?;
+        }
+        ("GitHub", "Refresh", "Interval") => {
+            app.config.github_refresh_interval = parse_refresh_interval(value)
+                .ok_or_else(|| "Invalid GitHub refresh interval.".to_string())?;
+        }
+        ("GitLab", "Refresh", "Interval") => {
+            app.config.gitlab_refresh_interval = parse_refresh_interval(value)
+                .ok_or_else(|| "Invalid GitLab refresh interval.".to_string())?;
+        }
+        ("DockerHub", "Refresh", "Interval") => {
+            app.config.dockerhub_refresh_interval = parse_refresh_interval(value)
+                .ok_or_else(|| "Invalid DockerHub refresh interval.".to_string())?;
+        }
+        _ => {}
+    }
+    app.sync_config_items();
+    app.persist_config()
+}
+
+fn optional_config_value(value: &str) -> Option<String> {
+    let value = value.trim();
+    if value.is_empty() {
+        None
+    } else {
+        Some(value.to_string())
+    }
+}
+
+fn cancel_config_edit(app: &mut AppState) {
+    app.mode = AppMode::Normal;
+    app.message = "Config edit cancelled.".to_string();
+}
+
 fn move_selection_up(app: &mut AppState) {
     match app.mode {
+        AppMode::Normal if app.tab == Tab::Config => app.move_config_up(),
         AppMode::Normal => app.move_up(),
         AppMode::TagList {
             ref mut selected, ..
@@ -522,6 +711,7 @@ fn move_selection_up(app: &mut AppState) {
                 *selected -= 1;
             }
         }
+        AppMode::ConfigEdit { .. } => {}
     }
 }
 
@@ -534,6 +724,7 @@ fn move_selection_down(app: &mut AppState) {
         String::new()
     };
     match app.mode {
+        AppMode::Normal if app.tab == Tab::Config => app.move_config_down(),
         AppMode::Normal => app.move_down(),
         AppMode::TagList {
             ref tags,
@@ -560,11 +751,13 @@ fn move_selection_down(app: &mut AppState) {
                 *selected += 1;
             }
         }
+        AppMode::ConfigEdit { .. } => {}
     }
 }
 
 fn page_selection_up(app: &mut AppState) {
     match app.mode {
+        AppMode::Normal if app.tab == Tab::Config => app.page_config_up(),
         AppMode::Normal => app.page_up(),
         AppMode::TagList {
             ref mut selected, ..
@@ -577,6 +770,7 @@ fn page_selection_up(app: &mut AppState) {
         } => {
             *selected = selected.saturating_sub(10);
         }
+        AppMode::ConfigEdit { .. } => {}
     }
 }
 
@@ -589,6 +783,7 @@ fn page_selection_down(app: &mut AppState) {
         String::new()
     };
     match app.mode {
+        AppMode::Normal if app.tab == Tab::Config => app.page_config_down(),
         AppMode::Normal => app.page_down(),
         AppMode::TagList {
             ref tags,
@@ -615,6 +810,7 @@ fn page_selection_down(app: &mut AppState) {
                 *selected = (*selected + 10).min(limit - 1);
             }
         }
+        AppMode::ConfigEdit { .. } => {}
     }
 }
 
@@ -831,10 +1027,14 @@ fn render(frame: &mut Frame<'_>, app: &mut AppState) {
                 render_preview(frame, body[1], app);
             }
         }
+        AppModeKind::ConfigEdit => {
+            render_config(frame, layout[2], app);
+            render_config_editor(frame, size, app);
+        }
         AppModeKind::Normal => {
             if app.tab == Tab::Config {
-                render_config(frame, layout[2]);
-            } else if preview_enabled() {
+                render_config(frame, layout[2], app);
+            } else if app.config.preview_enabled {
                 let body =
                     Layout::horizontal([Constraint::Percentage(62), Constraint::Percentage(38)])
                         .split(layout[2]);
@@ -846,17 +1046,6 @@ fn render(frame: &mut Frame<'_>, app: &mut AppState) {
         }
     }
     render_footer(frame, layout[3], app);
-}
-
-fn preview_enabled() -> bool {
-    matches!(
-        std::env::var("WEB_FZF_PREVIEW")
-            .ok()
-            .as_deref()
-            .map(str::to_ascii_lowercase)
-            .as_deref(),
-        Some("1") | Some("true") | Some("yes") | Some("on")
-    )
 }
 
 fn render_header(frame: &mut Frame<'_>, area: Rect, app: &AppState) {
@@ -1145,9 +1334,10 @@ fn render_footer(frame: &mut Frame<'_>, area: Rect, app: &AppState) {
         AppMode::ActionMenu { .. } | AppMode::RepoMenu { .. } => {
             "Up/Down=move  Ctrl+U/D=page  Enter=confirm  Backspace=back"
         }
+        AppMode::ConfigEdit { .. } => "Type=value  Enter=save  Esc=cancel  Backspace=delete",
         AppMode::Normal => {
             if app.tab == Tab::Config {
-                "Left/Right=switch tab  Ctrl+B=hide Config  Esc=quit"
+                "Up/Down=select  Enter=edit/toggle  Type=filter  Ctrl+B=hide Config  Esc=quit"
             } else if app.query.is_empty() {
                 "Enter=open  Ctrl+U/D=page  Ctrl+R=refresh tab  Ctrl+B=toggle Config  Esc=quit"
             } else {
@@ -1263,10 +1453,10 @@ fn render_action_menu(
     frame.render_stateful_widget(list, area, &mut state);
 }
 
-fn render_config(frame: &mut Frame<'_>, area: Rect) {
+fn render_config(frame: &mut Frame<'_>, area: Rect, app: &AppState) {
     let block = Block::default()
         .title(Span::styled(
-            " Config ",
+            " Config: Source / Feature / Setting ",
             Style::default()
                 .fg(Color::Cyan)
                 .add_modifier(Modifier::BOLD),
@@ -1274,7 +1464,162 @@ fn render_config(frame: &mut Frame<'_>, area: Rect) {
         .borders(Borders::ALL)
         .border_style(Style::default().fg(Color::DarkGray));
 
-    frame.render_widget(Paragraph::new("").block(block), area);
+    let inner_width = area.width.saturating_sub(2) as usize;
+    let level1_width = (inner_width / 7).clamp(12, 18);
+    let level3_width = (inner_width / 6).clamp(10, 18);
+    let value_width = (inner_width / 7).clamp(9, 18);
+    let detail_width = inner_width
+        .saturating_sub(level1_width)
+        .saturating_sub(level3_width)
+        .saturating_sub(value_width)
+        .saturating_sub(6);
+
+    let rows = config_display_rows(&app.config_items, &app.query);
+    let height = area.height.saturating_sub(2) as usize;
+    let row_count = rows.len();
+    let selected = app.selected.min(row_count.saturating_sub(1));
+    let start = selected
+        .saturating_sub(height.saturating_sub(1))
+        .min(row_count.saturating_sub(height));
+    let selected_in_window = selected.saturating_sub(start);
+    let items: Vec<ListItem> = if rows.is_empty() {
+        let text = if app.query.is_empty() {
+            "No config items."
+        } else {
+            "No matching config items."
+        };
+        vec![ListItem::new(text)]
+    } else {
+        rows.into_iter()
+            .skip(start)
+            .take(height.max(1))
+            .enumerate()
+            .map(|(row, idx)| {
+                let row_style = Style::default().bg(if row % 2 == 0 {
+                    ROW_EVEN_BG
+                } else {
+                    ROW_ODD_BG
+                });
+                match idx {
+                    ConfigDisplayRow::Group(group) => ListItem::new(Line::from(vec![
+                        Span::styled(
+                            pad_or_truncate(&format!("▼ {group}"), level1_width),
+                            Style::default()
+                                .fg(Color::Green)
+                                .add_modifier(Modifier::BOLD),
+                        ),
+                        Span::raw("  "),
+                        Span::styled(
+                            "contains configurable items",
+                            Style::default().fg(Color::DarkGray),
+                        ),
+                    ]))
+                    .style(row_style),
+                    ConfigDisplayRow::Item(idx) => {
+                        let item = &app.config_items[idx];
+                        ListItem::new(Line::from(vec![
+                            Span::styled(
+                                pad_or_truncate(&format!("    {}", item.level2), level1_width),
+                                Style::default().fg(Color::Yellow),
+                            ),
+                            Span::raw("  "),
+                            Span::styled(
+                                pad_or_truncate(&item.level3, level3_width),
+                                Style::default()
+                                    .fg(Color::White)
+                                    .add_modifier(Modifier::BOLD),
+                            ),
+                            Span::raw("  "),
+                            Span::styled(
+                                pad_or_truncate(&item.current, value_width),
+                                Style::default().fg(Color::Cyan),
+                            ),
+                            Span::raw("  "),
+                            Span::styled(
+                                truncate_to_width(&item.detail, detail_width),
+                                Style::default().fg(Color::Gray),
+                            ),
+                        ]))
+                        .style(row_style)
+                    }
+                }
+            })
+            .collect()
+    };
+
+    let mut state = ListState::default();
+    if row_count > 0 {
+        state.select(Some(selected_in_window));
+    }
+
+    let list = List::new(items)
+        .block(block)
+        .highlight_style(
+            Style::default()
+                .fg(Color::White)
+                .bg(SELECTED_ROW_BG)
+                .add_modifier(Modifier::BOLD),
+        )
+        .highlight_symbol("❯ ");
+
+    frame.render_stateful_widget(list, area, &mut state);
+}
+
+fn render_config_editor(frame: &mut Frame<'_>, area: Rect, app: &AppState) {
+    let AppMode::ConfigEdit { item_index, buffer } = &app.mode else {
+        return;
+    };
+    let Some(item) = app.config_items.get(*item_index) else {
+        return;
+    };
+
+    let width = area.width.min(90).max(40);
+    let height = 7;
+    let x = area.x + area.width.saturating_sub(width) / 2;
+    let y = area.y + area.height.saturating_sub(height) / 2;
+    let popup = Rect::new(x, y, width, height);
+    let value = if item.edit_kind == ConfigEditKind::Secret {
+        "*".repeat(buffer.chars().count())
+    } else {
+        buffer.clone()
+    };
+    let lines = vec![
+        Line::from(vec![
+            Span::styled("Path", Style::default().fg(Color::Cyan)),
+            Span::raw(": "),
+            Span::styled(
+                format!("{} / {} / {}", item.level1, item.level2, item.level3),
+                Style::default().fg(Color::White),
+            ),
+        ]),
+        Line::from(vec![
+            Span::styled("Value", Style::default().fg(Color::Cyan)),
+            Span::raw(": "),
+            Span::styled(value, Style::default().fg(Color::White)),
+        ]),
+        Line::from(Span::styled(
+            "Enter=save  Esc=cancel  Backspace=delete",
+            Style::default().fg(Color::DarkGray),
+        )),
+    ];
+
+    frame.render_widget(Clear, popup);
+    frame.render_widget(
+        Paragraph::new(lines)
+            .block(
+                Block::default()
+                    .title(Span::styled(
+                        " Edit Config ",
+                        Style::default()
+                            .fg(Color::Cyan)
+                            .add_modifier(Modifier::BOLD),
+                    ))
+                    .borders(Borders::ALL)
+                    .border_style(Style::default().fg(Color::Cyan)),
+            )
+            .wrap(Wrap { trim: true }),
+        popup,
+    );
 }
 
 fn source_color(source: &str) -> Color {
@@ -1346,14 +1691,7 @@ enum Tab {
     Config,
 }
 
-const DEFAULT_TABS: [Tab; 4] = [Tab::History, Tab::GitHub, Tab::GitLab, Tab::DockerHub];
-const CONFIG_TABS: [Tab; 5] = [
-    Tab::History,
-    Tab::GitHub,
-    Tab::GitLab,
-    Tab::DockerHub,
-    Tab::Config,
-];
+const BASE_TABS: [Tab; 4] = [Tab::History, Tab::GitHub, Tab::GitLab, Tab::DockerHub];
 
 impl Tab {
     fn matches(self, entry: &Entry) -> bool {
@@ -1487,6 +1825,79 @@ fn rank_entries_all_with_haystacks(
     ranked
 }
 
+fn ranked_config_items(items: &[ConfigItem], query: &str) -> Vec<usize> {
+    if query.is_empty() {
+        return (0..items.len()).collect();
+    }
+
+    let normalized_query = query.to_ascii_lowercase();
+    let mut matcher = FuzzyMatcher::new(query);
+    let mut ranked: Vec<(i64, usize)> = items
+        .iter()
+        .enumerate()
+        .filter_map(|(idx, item)| {
+            matcher.score(&item.haystack).map(|m| {
+                let path =
+                    format!("{} {} {}", item.level1, item.level2, item.level3).to_ascii_lowercase();
+                let query_terms_match_path = normalized_query
+                    .split_whitespace()
+                    .all(|term| path.contains(term));
+                let name_boost = if path.contains(&normalized_query) || query_terms_match_path {
+                    10_000
+                } else {
+                    0
+                };
+                (m.score + name_boost, idx)
+            })
+        })
+        .collect();
+
+    ranked.sort_by(|a, b| match b.0.cmp(&a.0) {
+        Ordering::Equal => a.1.cmp(&b.1),
+        other => other,
+    });
+    ranked.into_iter().map(|(_, idx)| idx).collect()
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+enum ConfigDisplayRow {
+    Group(String),
+    Item(usize),
+}
+
+const CONFIG_GROUP_ORDER: [&str; 5] = ["Browser", "GitHub", "GitLab", "DockerHub", "System"];
+
+fn config_display_rows(items: &[ConfigItem], query: &str) -> Vec<ConfigDisplayRow> {
+    let ranked = ranked_config_items(items, query);
+    let mut rows = Vec::new();
+
+    for group in CONFIG_GROUP_ORDER {
+        let group_items: Vec<usize> = ranked
+            .iter()
+            .copied()
+            .filter(|idx| items[*idx].level1 == group)
+            .collect();
+        if group_items.is_empty() {
+            continue;
+        }
+        rows.push(ConfigDisplayRow::Group(group.to_string()));
+        rows.extend(group_items.into_iter().map(ConfigDisplayRow::Item));
+    }
+
+    for idx in ranked {
+        if CONFIG_GROUP_ORDER
+            .iter()
+            .any(|group| items[idx].level1 == *group)
+        {
+            continue;
+        }
+        rows.push(ConfigDisplayRow::Group(items[idx].level1.clone()));
+        rows.push(ConfigDisplayRow::Item(idx));
+    }
+
+    rows
+}
+
 fn entry_haystacks(entries: &[Entry]) -> Vec<String> {
     entries.iter().map(Entry::haystack).collect()
 }
@@ -1509,6 +1920,10 @@ fn deduplicate_entries(entries: Vec<Entry>) -> Vec<Entry> {
 struct AppState {
     entries: Vec<Entry>,
     haystacks: Vec<String>,
+    config: Config,
+    config_items: Vec<ConfigItem>,
+    runtime_config: RuntimeConfig,
+    shared_config: Arc<Mutex<Config>>,
     visible: Vec<usize>,
     query: String,
     selected: usize,
@@ -1520,6 +1935,53 @@ struct AppState {
     cursor_visible: bool,
     mode: AppMode,
     dirty: bool,
+}
+
+struct ConfigItem {
+    level1: String,
+    level2: String,
+    level3: String,
+    current: String,
+    detail: String,
+    haystack: String,
+    edit_kind: ConfigEditKind,
+}
+
+impl ConfigItem {
+    fn new(
+        level1: impl Into<String>,
+        level2: impl Into<String>,
+        level3: impl Into<String>,
+        current: impl Into<String>,
+        configure: impl Into<String>,
+        detail: impl Into<String>,
+        edit_kind: ConfigEditKind,
+    ) -> Self {
+        let level1 = level1.into();
+        let level2 = level2.into();
+        let level3 = level3.into();
+        let current = current.into();
+        let configure = configure.into();
+        let detail = detail.into();
+        let haystack = format!("{level1} {level2} {level3} {current} {configure} {detail}");
+        Self {
+            level1,
+            level2,
+            level3,
+            current,
+            detail,
+            haystack,
+            edit_kind,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ConfigEditKind {
+    Toggle,
+    Text,
+    Secret,
+    ReadOnly,
 }
 
 enum AppMode {
@@ -1538,6 +2000,10 @@ enum AppMode {
     RepoMenu {
         selected: usize,
     },
+    ConfigEdit {
+        item_index: usize,
+        buffer: String,
+    },
 }
 
 impl AppMode {
@@ -1547,6 +2013,7 @@ impl AppMode {
             AppMode::TagList { .. } => AppModeKind::TagList,
             AppMode::ActionMenu { .. } => AppModeKind::ActionMenu,
             AppMode::RepoMenu { .. } => AppModeKind::RepoMenu,
+            AppMode::ConfigEdit { .. } => AppModeKind::ConfigEdit,
         }
     }
 }
@@ -1559,11 +2026,21 @@ impl AppState {
         }
     }
 
-    fn new(entries: Vec<Entry>) -> Self {
+    fn new(
+        entries: Vec<Entry>,
+        config: Config,
+        runtime_config: RuntimeConfig,
+        shared_config: Arc<Mutex<Config>>,
+    ) -> Self {
         let haystacks = entry_haystacks(&entries);
+        let config_items = build_config_items(&config);
         let mut app = Self {
             entries,
             haystacks,
+            config: config.clone(),
+            config_items,
+            runtime_config,
+            shared_config,
             visible: Vec::new(),
             query: String::new(),
             selected: 0,
@@ -1571,7 +2048,7 @@ impl AppState {
             result_viewport_height: 0,
             message: "Type to search.".to_string(),
             tab: Tab::History,
-            config_tab_visible: false,
+            config_tab_visible: true,
             cursor_visible: true,
             mode: AppMode::Normal,
             dirty: false,
@@ -1588,6 +2065,15 @@ impl AppState {
     }
 
     fn recompute(&mut self) {
+        self.ensure_current_tab_visible();
+        if self.tab == Tab::Config {
+            self.visible.clear();
+            self.selected = self
+                .selected
+                .min(self.config_result_count().saturating_sub(1));
+            self.scroll_start = 0;
+            return;
+        }
         self.visible = rank_entries(&self.entries, &self.haystacks, &self.query, self.tab)
             .into_iter()
             .map(|(_, idx)| idx)
@@ -1604,11 +2090,39 @@ impl AppState {
             .and_then(|idx| self.entries.get(*idx))
     }
 
-    fn visible_tabs(&self) -> &'static [Tab] {
+    fn selected_config_item_index(&self) -> Option<usize> {
+        config_display_rows(&self.config_items, &self.query)
+            .get(self.selected)
+            .and_then(|row| match row {
+                ConfigDisplayRow::Group(_) => None,
+                ConfigDisplayRow::Item(idx) => Some(*idx),
+            })
+    }
+
+    fn source_tabs(&self) -> Vec<Tab> {
+        let mut tabs = Vec::new();
+        for tab in BASE_TABS {
+            if self.tab_enabled(tab) {
+                tabs.push(tab);
+            }
+        }
         if self.config_tab_visible {
-            &CONFIG_TABS
-        } else {
-            &DEFAULT_TABS
+            tabs.push(Tab::Config);
+        }
+        tabs
+    }
+
+    fn visible_tabs(&self) -> Vec<Tab> {
+        self.source_tabs()
+    }
+
+    fn tab_enabled(&self, tab: Tab) -> bool {
+        match tab {
+            Tab::History => self.runtime_config.include_browser(),
+            Tab::GitHub => self.runtime_config.include_github(),
+            Tab::GitLab => self.runtime_config.include_gitlab(),
+            Tab::DockerHub => self.runtime_config.include_dockerhub(),
+            Tab::Config => self.config_tab_visible,
         }
     }
 
@@ -1716,6 +2230,49 @@ impl AppState {
         self.ensure_selected_visible();
     }
 
+    fn config_result_count(&self) -> usize {
+        config_display_rows(&self.config_items, &self.query).len()
+    }
+
+    fn move_config_up(&mut self) {
+        if self.selected > 0 {
+            self.selected -= 1;
+        }
+    }
+
+    fn move_config_down(&mut self) {
+        let count = self.config_result_count();
+        if self.selected + 1 < count {
+            self.selected += 1;
+        }
+    }
+
+    fn page_config_up(&mut self) {
+        self.selected = self.selected.saturating_sub(10);
+    }
+
+    fn page_config_down(&mut self) {
+        let count = self.config_result_count();
+        if count > 0 {
+            self.selected = (self.selected + 10).min(count - 1);
+        }
+    }
+
+    fn push_config_edit_char(&mut self, ch: char) {
+        if let AppMode::ConfigEdit { ref mut buffer, .. } = self.mode {
+            buffer.push(ch);
+        }
+    }
+
+    fn pop_config_edit_char(&mut self) {
+        if let AppMode::ConfigEdit { ref mut buffer, .. } = self.mode {
+            if let Some(grapheme) = buffer.graphemes(true).next_back() {
+                let new_len = buffer.len().saturating_sub(grapheme.len());
+                buffer.truncate(new_len);
+            }
+        }
+    }
+
     fn jump_top(&mut self) {
         self.selected = 0;
         self.ensure_selected_visible();
@@ -1731,6 +2288,9 @@ impl AppState {
 
     fn next_tab(&mut self) {
         let tabs = self.visible_tabs();
+        if tabs.is_empty() {
+            return;
+        }
         let current = self.selected_tab_index();
         self.tab = tabs[(current + 1) % tabs.len()];
         self.selected = 0;
@@ -1740,6 +2300,9 @@ impl AppState {
 
     fn previous_tab(&mut self) {
         let tabs = self.visible_tabs();
+        if tabs.is_empty() {
+            return;
+        }
         let current = self.selected_tab_index();
         self.tab = tabs[(current + tabs.len() - 1) % tabs.len()];
         self.selected = 0;
@@ -1761,7 +2324,44 @@ impl AppState {
         }
         self.selected = 0;
         self.scroll_start = 0;
+        self.ensure_current_tab_visible();
         self.recompute();
+    }
+
+    fn set_source_enabled(&mut self, level1: &str, enabled: bool) {
+        match level1 {
+            "Browser" => {
+                self.config.include_browser = enabled;
+                self.runtime_config.set_include_browser(enabled);
+            }
+            "GitHub" => {
+                self.config.include_github = enabled;
+                self.runtime_config.set_include_github(enabled);
+            }
+            "GitLab" => {
+                self.config.include_gitlab = enabled;
+                self.runtime_config.set_include_gitlab(enabled);
+            }
+            "DockerHub" => {
+                self.config.include_dockerhub = enabled;
+                self.runtime_config.set_include_dockerhub(enabled);
+            }
+            _ => {}
+        }
+        self.ensure_current_tab_visible();
+    }
+
+    fn ensure_current_tab_visible(&mut self) {
+        if self.tab_enabled(self.tab) {
+            return;
+        }
+        self.tab = self
+            .visible_tabs()
+            .into_iter()
+            .find(|tab| *tab != Tab::Config)
+            .unwrap_or(Tab::Config);
+        self.selected = 0;
+        self.scroll_start = 0;
     }
 
     fn replace_entries_for_sources(&mut self, sources: &[String], rows: Vec<Entry>) {
@@ -1773,6 +2373,215 @@ impl AppState {
         self.entries = deduplicate_entries(merged);
         self.haystacks = entry_haystacks(&self.entries);
         self.recompute();
+    }
+
+    fn sync_config_items(&mut self) {
+        self.config_items = build_config_items(&self.config);
+    }
+
+    fn persist_config(&mut self) -> Result<(), String> {
+        if let Ok(mut shared) = self.shared_config.lock() {
+            *shared = self.config.clone();
+        }
+        self.config.save_to_disk()
+    }
+}
+
+fn build_config_items(config: &Config) -> Vec<ConfigItem> {
+    vec![
+        ConfigItem::new(
+            "Browser",
+            "Source",
+            "Enabled",
+            enabled_text(config.include_browser),
+            "--no-browser",
+            "Local browser history and bookmarks. Safari on macOS may require Full Disk Access for the terminal.",
+            ConfigEditKind::Toggle,
+        ),
+        ConfigItem::new(
+            "GitHub",
+            "Source",
+            "Enabled",
+            enabled_text(config.include_github),
+            "--no-github",
+            "Search repositories visible to GitHub. Use GITHUB_TOKEN for private or organization repositories, or GITHUB_USER for public user repositories.",
+            ConfigEditKind::Toggle,
+        ),
+        ConfigItem::new(
+            "GitLab",
+            "Source",
+            "Enabled",
+            enabled_text(config.include_gitlab),
+            "--no-gitlab",
+            "Search GitLab projects. Use GITLAB_TOKEN for membership projects; otherwise only public projects are queried.",
+            ConfigEditKind::Toggle,
+        ),
+        ConfigItem::new(
+            "DockerHub",
+            "Source",
+            "Enabled",
+            enabled_text(config.include_dockerhub),
+            "--no-dockerhub",
+            "Search DockerHub repositories for DOCKERHUB_USERNAME. A token enables private repositories.",
+            ConfigEditKind::Toggle,
+        ),
+        ConfigItem::new(
+            "GitHub",
+            "Auth",
+            "Token",
+            secret_status(config.github_token.as_deref()),
+            "--github-token <token> or GITHUB_TOKEN",
+            "Recommended acquisition: install gh, run gh auth login, then export GITHUB_TOKEN=$(gh auth token). Token needs repository read access for private repos.",
+            ConfigEditKind::Secret,
+        ),
+        ConfigItem::new(
+            "GitHub",
+            "Auth",
+            "User",
+            optional_value(config.github_user.as_deref()),
+            "--github-user <user> or GITHUB_USER",
+            "Used when no token is provided. Fetches public owner repositories for the configured user.",
+            ConfigEditKind::Text,
+        ),
+        ConfigItem::new(
+            "GitLab",
+            "Auth",
+            "Token",
+            secret_status(config.gitlab_token.as_deref()),
+            "--gitlab-token <token> or GITLAB_TOKEN",
+            "Recommended acquisition when glab is available: glab auth login, then export GITLAB_TOKEN=$(glab auth token). Token should have read_api scope.",
+            ConfigEditKind::Secret,
+        ),
+        ConfigItem::new(
+            "DockerHub",
+            "Auth",
+            "Token",
+            secret_status(config.dockerhub_token.as_deref()),
+            "--dockerhub-token <token> or DOCKERHUB_TOKEN",
+            "Create a DockerHub Personal Access Token and export DOCKERHUB_TOKEN. Future automatic flow can read docker login credentials or request a PAT interactively.",
+            ConfigEditKind::Secret,
+        ),
+        ConfigItem::new(
+            "DockerHub",
+            "Auth",
+            "Username",
+            optional_value(config.dockerhub_username.as_deref()),
+            "--dockerhub-user <user> or DOCKERHUB_USERNAME",
+            "Required for DockerHub repository search.",
+            ConfigEditKind::Text,
+        ),
+        ConfigItem::new(
+            "GitHub",
+            "API",
+            "Base URL",
+            config.github_api.clone(),
+            "--github-api <url> or GITHUB_API",
+            "Set this for GitHub Enterprise, for example https://github.example.com/api/v3.",
+            ConfigEditKind::Text,
+        ),
+        ConfigItem::new(
+            "GitLab",
+            "API",
+            "Base URL",
+            config.gitlab_api.clone(),
+            "--gitlab-api <url> or GITLAB_API",
+            "Set this for self-hosted GitLab, for example https://gitlab.example.com/api/v4.",
+            ConfigEditKind::Text,
+        ),
+        ConfigItem::new(
+            "Browser",
+            "Refresh",
+            "Interval",
+            format_duration(config.history_refresh_interval),
+            "WEB_FZF_HISTORY_REFRESH",
+            "Accepts plain seconds, seconds such as 5s, or minutes such as 1min.",
+            ConfigEditKind::Text,
+        ),
+        ConfigItem::new(
+            "GitHub",
+            "Refresh",
+            "Interval",
+            format_duration(config.github_refresh_interval),
+            "WEB_FZF_GITHUB_REFRESH",
+            "Remote cache is used immediately; refresh runs in the background when this interval has elapsed.",
+            ConfigEditKind::Text,
+        ),
+        ConfigItem::new(
+            "GitLab",
+            "Refresh",
+            "Interval",
+            format_duration(config.gitlab_refresh_interval),
+            "WEB_FZF_GITLAB_REFRESH",
+            "Remote cache is kept if refresh fails or returns no rows.",
+            ConfigEditKind::Text,
+        ),
+        ConfigItem::new(
+            "DockerHub",
+            "Refresh",
+            "Interval",
+            format_duration(config.dockerhub_refresh_interval),
+            "WEB_FZF_DOCKERHUB_REFRESH",
+            "Controls DockerHub repository cache refresh frequency.",
+            ConfigEditKind::Text,
+        ),
+        ConfigItem::new(
+            "System",
+            "Display",
+            "Preview pane",
+            enabled_text(config.preview_enabled),
+            "WEB_FZF_PREVIEW or config file",
+            "Enables the preview pane in normal result views.",
+            ConfigEditKind::Toggle,
+        ),
+        ConfigItem::new(
+            "System",
+            "Diagnostics",
+            "Debug logging",
+            enabled_text(config.debug),
+            "--debug",
+            "Writes diagnostics to stderr. Redirect stderr to a file so it does not interfere with the TUI.",
+            ConfigEditKind::Toggle,
+        ),
+        ConfigItem::new(
+            "System",
+            "Automation",
+            "Token plan",
+            "planned",
+            "Config tab action menu",
+            "GitHub can shell out to gh auth token, GitLab can shell out to glab auth token, and DockerHub can import existing docker login credentials or guide PAT creation. Tokens should be shown as present/missing only.",
+            ConfigEditKind::ReadOnly,
+        ),
+    ]
+}
+
+fn enabled_text(value: bool) -> &'static str {
+    if value {
+        "enabled"
+    } else {
+        "disabled"
+    }
+}
+
+fn secret_status(value: Option<&str>) -> &'static str {
+    match value {
+        Some(value) if !value.is_empty() => "present",
+        _ => "missing",
+    }
+}
+
+fn optional_value(value: Option<&str>) -> String {
+    value
+        .filter(|value| !value.is_empty())
+        .unwrap_or("not set")
+        .to_string()
+}
+
+fn format_duration(duration: Duration) -> String {
+    let seconds = duration.as_secs();
+    if seconds >= 60 && seconds % 60 == 0 {
+        format!("{}min", seconds / 60)
+    } else {
+        format!("{seconds}s")
     }
 }
 
@@ -1826,11 +2635,21 @@ impl Drop for TerminalSession {
 #[cfg(test)]
 mod tests {
     use super::{
-        best_entry, display_width, entry_haystacks, open_selected_entry, parse_next_input_key,
-        rank_entries, resolve_action, tab_count, Action, AppMode, AppModeKind, AppState, InputCode,
-        InputKey, Tab,
+        best_entry, commit_config_edit, config_display_rows, display_width, entry_haystacks,
+        open_selected_entry, parse_next_input_key, rank_entries, ranked_config_items,
+        resolve_action, start_config_edit, tab_count, Action, AppMode, AppModeKind, AppState,
+        ConfigDisplayRow, InputCode, InputKey, Tab,
     };
+    use crate::config::{Config, RuntimeConfig};
     use crate::models::Entry;
+    use std::sync::{Arc, Mutex};
+
+    fn app_state(entries: Vec<Entry>) -> AppState {
+        let config = Config::default();
+        let runtime_config = RuntimeConfig::new(&config);
+        let shared_config = Arc::new(Mutex::new(config.clone()));
+        AppState::new(entries, config, runtime_config, shared_config)
+    }
 
     #[test]
     fn best_entry_prefers_stronger_match() {
@@ -1877,7 +2696,7 @@ mod tests {
 
     #[test]
     fn dockerhub_entry_without_tags_opens_action_menu() {
-        let mut app = AppState::new(vec![Entry::new(
+        let mut app = app_state(vec![Entry::new(
             "juhaoming/ubuntu-dev",
             "https://hub.docker.com/r/juhaoming/ubuntu-dev",
             "public",
@@ -1906,7 +2725,7 @@ mod tests {
 
     #[test]
     fn github_entry_opens_action_menu() {
-        let mut app = AppState::new(vec![Entry::new(
+        let mut app = app_state(vec![Entry::new(
             "juhaoming/web-fzf",
             "https://github.com/juhaoming/web-fzf",
             "github",
@@ -1927,7 +2746,7 @@ mod tests {
 
     #[test]
     fn gitlab_entry_opens_action_menu() {
-        let mut app = AppState::new(vec![Entry::new(
+        let mut app = app_state(vec![Entry::new(
             "platform/psd/auto-server/parking_fusion",
             "https://gitlab.example.com/platform/psd/auto-server/parking_fusion",
             "gitlab",
@@ -1958,7 +2777,7 @@ mod tests {
                 )
             })
             .collect();
-        let mut app = AppState::new(entries);
+        let mut app = app_state(entries);
         app.set_result_viewport_height(3);
 
         assert_eq!(app.selected, 0);
@@ -1993,7 +2812,7 @@ mod tests {
     #[test]
     fn chinese_input_uses_display_width_and_backspace_removes_whole_grapheme() {
         assert_eq!(display_width("中文"), 4);
-        let mut app = AppState::new(Vec::new());
+        let mut app = app_state(Vec::new());
         app.push_char('中');
         app.push_char('文');
         assert_eq!(app.query, "中文");
@@ -2113,18 +2932,31 @@ mod tests {
     }
 
     #[test]
-    fn config_tab_is_hidden_until_toggled() {
-        let mut app = AppState::new(Vec::new());
+    fn config_tab_is_visible_by_default_and_can_be_toggled() {
+        let mut app = app_state(Vec::new());
         assert_eq!(
             app.visible_tabs(),
-            &[Tab::History, Tab::GitHub, Tab::GitLab, Tab::DockerHub]
+            vec![
+                Tab::History,
+                Tab::GitHub,
+                Tab::GitLab,
+                Tab::DockerHub,
+                Tab::Config,
+            ]
         );
         assert_eq!(app.tab, Tab::History);
 
         app.toggle_config_tab();
         assert_eq!(
             app.visible_tabs(),
-            &[
+            vec![Tab::History, Tab::GitHub, Tab::GitLab, Tab::DockerHub]
+        );
+        assert_eq!(app.tab, Tab::History);
+
+        app.toggle_config_tab();
+        assert_eq!(
+            app.visible_tabs(),
+            vec![
                 Tab::History,
                 Tab::GitHub,
                 Tab::GitLab,
@@ -2135,31 +2967,132 @@ mod tests {
         assert_eq!(app.tab, Tab::Config);
         assert_eq!(app.selected_tab_index(), 4);
         assert!(app.visible.is_empty());
+    }
 
-        app.toggle_config_tab();
+    #[test]
+    fn config_items_are_searchable() {
+        let app = app_state(Vec::new());
+        let rows = ranked_config_items(&app.config_items, "github token");
+        assert!(!rows.is_empty());
+        assert_eq!(app.config_items[rows[0]].level1, "GitHub");
+        assert_eq!(app.config_items[rows[0]].level2, "Auth");
+        assert_eq!(app.config_items[rows[0]].level3, "Token");
+    }
+
+    #[test]
+    fn config_items_use_source_grouped_hierarchy() {
+        let app = app_state(Vec::new());
+        assert!(app.config_items.iter().any(|item| {
+            item.level1 == "DockerHub" && item.level2 == "Auth" && item.level3 == "Username"
+        }));
+        assert!(app.config_items.iter().any(|item| {
+            item.level1 == "Browser" && item.level2 == "Refresh" && item.level3 == "Interval"
+        }));
+        assert!(app.config_items.iter().any(|item| {
+            item.level1 == "GitHub" && item.level2 == "Source" && item.level3 == "Enabled"
+        }));
+    }
+
+    #[test]
+    fn config_display_rows_include_expanded_function_headers() {
+        let app = app_state(Vec::new());
+        let rows = config_display_rows(&app.config_items, "github token");
+        assert!(matches!(
+            rows.first(),
+            Some(ConfigDisplayRow::Group(group)) if group == "GitHub"
+        ));
+        assert!(matches!(rows.get(1), Some(ConfigDisplayRow::Item(_))));
+    }
+
+    #[test]
+    fn config_display_rows_group_all_items_under_source_header() {
+        let app = app_state(Vec::new());
+        let rows = config_display_rows(&app.config_items, "");
+        let github_start = rows
+            .iter()
+            .position(|row| matches!(row, ConfigDisplayRow::Group(group) if group == "GitHub"))
+            .unwrap();
+        let next_group = rows[github_start + 1..]
+            .iter()
+            .position(|row| matches!(row, ConfigDisplayRow::Group(_)))
+            .map(|offset| github_start + 1 + offset)
+            .unwrap_or(rows.len());
+        let github_settings: Vec<_> = rows[github_start + 1..next_group]
+            .iter()
+            .filter_map(|row| match row {
+                ConfigDisplayRow::Item(idx) => Some(app.config_items[*idx].level3.as_str()),
+                ConfigDisplayRow::Group(_) => None,
+            })
+            .collect();
+
         assert_eq!(
-            app.visible_tabs(),
-            &[Tab::History, Tab::GitHub, Tab::GitLab, Tab::DockerHub]
+            github_settings,
+            vec!["Enabled", "Token", "User", "Base URL", "Interval"]
         );
-        assert_eq!(app.tab, Tab::History);
+    }
+
+    #[test]
+    fn selected_config_item_can_change_value() {
+        let mut app = app_state(Vec::new());
+        app.query = "browser sources".to_string();
+        app.tab = Tab::Config;
+        app.recompute();
+        app.move_config_down();
+
+        start_config_edit(&mut app);
+        assert_eq!(
+            app.config_items[app.selected_config_item_index().unwrap()].current,
+            "disabled"
+        );
+
+        app.query = "github user".to_string();
+        app.recompute();
+        app.selected = 0;
+        app.move_config_down();
+        start_config_edit(&mut app);
+        app.push_config_edit_char('m');
+        app.push_config_edit_char('e');
+        commit_config_edit(&mut app);
+        let item = &app.config_items[app.selected_config_item_index().unwrap()];
+        assert_eq!(item.level1, "GitHub");
+        assert_eq!(item.level2, "Auth");
+        assert_eq!(item.level3, "User");
+        assert_eq!(item.current, "me");
     }
 
     #[test]
     fn tab_navigation_includes_config_only_when_visible() {
-        let mut app = AppState::new(Vec::new());
+        let mut app = app_state(Vec::new());
         app.previous_tab();
-        assert_eq!(app.tab, Tab::DockerHub);
+        assert_eq!(app.tab, Tab::Config);
 
         app.toggle_config_tab();
         app.previous_tab();
         assert_eq!(app.tab, Tab::DockerHub);
-        app.next_tab();
+
+        app.toggle_config_tab();
         assert_eq!(app.tab, Tab::Config);
     }
 
     #[test]
+    fn disabling_source_hides_tab_and_moves_selection() {
+        let mut app = app_state(Vec::new());
+        app.toggle_config_tab();
+        app.tab = Tab::GitHub;
+        app.query = "github enabled".to_string();
+        app.recompute();
+        app.move_config_down();
+
+        start_config_edit(&mut app);
+
+        assert!(!app.runtime_config.include_github());
+        assert!(!app.visible_tabs().contains(&Tab::GitHub));
+        assert_eq!(app.tab, Tab::History);
+    }
+
+    #[test]
     fn replace_entries_for_sources_updates_existing_browser_entries() {
-        let mut app = AppState::new(vec![
+        let mut app = app_state(vec![
             Entry::new("Old", "https://old", "history", ""),
             Entry::new("Repo", "https://github.com/me/repo", "github", ""),
         ]);

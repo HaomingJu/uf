@@ -60,6 +60,7 @@ cargo install --git https://github.com/HaomingJu/uf
 - `Ctrl+U` / `Ctrl+D` to jump up or down
 - `Left` / `Right` or `Tab` to switch between tabs
 - `Ctrl+R` to refresh the current tab
+- `Ctrl+B` to hide or show the `Config` tab
 - `Enter` to open the selected URL
 - On `GitHub` and `GitLab`, `Enter` opens an action menu with `Open in browser` and `Copy repository address`, while the preview pane keeps showing the project details
 - `Backspace` to delete search text, or go back one level inside DockerHub tag/action views
@@ -71,6 +72,7 @@ Tabs:
 - `GitHub` shows repositories visible to the configured GitHub account or user, with `path/repo` shown in the list and details in the preview pane
 - `GitLab` shows visible GitLab projects by `path_with_namespace`, with details in the preview pane
 - `DockerHub` shows repositories belonging to the configured DockerHub user, with the list focused on the repository name and the secondary menu showing the repository description in the preview pane
+- `Config` is shown by default. Press `Ctrl+B` to hide or show it. It is organized as a multi-level menu: level 1 is the source or app area such as `Browser`, `GitHub`, `GitLab`, `DockerHub`, or `System`; level 2 is the feature group such as `Source`, `Auth`, `API`, `Refresh`, `Display`, `Diagnostics`, or `Automation`; level 3 is the concrete setting. Top-level groups that contain child items are shown with a `▼` prefix, and child configuration rows are indented by four spaces. Type in the search box to filter configuration items by group, name, environment variable, command-line flag, or setup guidance. Use `Up` / `Down` to select a row and `Enter` to toggle or edit the selected value.
 
 For DockerHub results, `Enter` opens a tag picker when tags are cached. If no tags are available, it opens the action menu directly so the repository can still be opened in the browser or copied as a `docker pull` command. The action menu keeps the repository description visible in the preview pane.
 
@@ -113,6 +115,45 @@ Environment variables:
 Refresh interval values may be plain seconds such as `60`, seconds such as `5s`, or minutes such as `1min`.
 
 DockerHub shows only public repositories when no token is provided. With a Personal Access Token (PAT), private repositories are also visible.
+
+### Token setup
+
+The `Config` tab shows token status as `present` or `missing`; token values are never displayed. Editing values in the Config tab changes the current in-app configuration view only. Persist values by exporting the shown environment variables or passing the shown command-line flags when launching `uf`.
+
+GitHub:
+
+```bash
+gh auth login
+export GITHUB_TOKEN="$(gh auth token)"
+```
+
+For public user repositories without a token:
+
+```bash
+export GITHUB_USER=myuser
+```
+
+GitLab:
+
+```bash
+glab auth login
+export GITLAB_TOKEN="$(glab auth token)"
+```
+
+For self-hosted GitLab:
+
+```bash
+export GITLAB_API="https://gitlab.example.com/api/v4"
+```
+
+DockerHub:
+
+```bash
+export DOCKERHUB_USERNAME=myuser
+export DOCKERHUB_TOKEN="<personal-access-token>"
+```
+
+Future automatic token acquisition should use explicit user action from the `Config` tab. The intended scheme is to read GitHub tokens through `gh auth token`, GitLab tokens through `glab auth token`, and DockerHub credentials only from an existing Docker login or a user-provided PAT. The UI should continue to show only presence, never raw token values.
 
 ## Refresh behavior
 

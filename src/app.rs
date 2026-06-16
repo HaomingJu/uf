@@ -1,4 +1,4 @@
-use crate::config::Config;
+use crate::config::{Config, RuntimeConfig};
 use crate::sources::{
     browser_source_signature, fetch_dockerhub_page, fetch_github_page, fetch_gitlab_page,
     load_cached_remote_with_refresh_check, load_local_browser_entries, save_remote_cache,
@@ -9,13 +9,15 @@ use std::env;
 use std::sync::mpsc;
 use std::sync::{
     atomic::{AtomicBool, Ordering as AtomicOrdering},
-    Arc,
+    Arc, Mutex,
 };
 use std::thread;
 use std::time::Duration;
 
 pub fn run() -> Result<(), String> {
     let config = parse_args(env::args().skip(1))?;
+    let runtime_config = RuntimeConfig::new(&config);
+    let shared_config = Arc::new(Mutex::new(config.clone()));
 
     // 并行加载：浏览器历史 + 三个远程缓存同时读取，同时判断是否需要刷新
     let include_browser = config.include_browser;
@@ -84,6 +86,7 @@ pub fn run() -> Result<(), String> {
     if github_needs_refresh {
         try_spawn_github_refresh(
             config.clone(),
+            runtime_config.clone(),
             tx.clone(),
             refresh_state.github.clone(),
             Duration::from_millis(800),
@@ -92,6 +95,7 @@ pub fn run() -> Result<(), String> {
     if gitlab_needs_refresh {
         try_spawn_gitlab_refresh(
             config.clone(),
+            runtime_config.clone(),
             tx.clone(),
             refresh_state.gitlab.clone(),
             Duration::from_millis(800),
@@ -100,6 +104,7 @@ pub fn run() -> Result<(), String> {
     if dockerhub_needs_refresh {
         try_spawn_dockerhub_refresh(
             config.clone(),
+            runtime_config.clone(),
             tx.clone(),
             refresh_state.dockerhub.clone(),
             Duration::from_millis(800),
@@ -108,14 +113,29 @@ pub fn run() -> Result<(), String> {
     if config.include_browser {
         spawn_browser_refresh(
             config.history_refresh_interval,
+            runtime_config.clone(),
             tx.clone(),
             refresh_state.history.clone(),
         );
     }
-    spawn_refresh_request_handler(config, tx.clone(), refresh_state, refresh_rx);
+    spawn_refresh_request_handler(
+        config.clone(),
+        shared_config.clone(),
+        runtime_config.clone(),
+        tx.clone(),
+        refresh_state,
+        refresh_rx,
+    );
 
     drop(tx);
-    run_ui(entries, rx, refresh_tx)
+    run_ui(
+        entries,
+        config,
+        runtime_config,
+        shared_config,
+        rx,
+        refresh_tx,
+    )
 }
 
 #[derive(Clone, Default)]
@@ -138,7 +158,7 @@ fn parse_args<I>(args: I) -> Result<Config, String>
 where
     I: IntoIterator<Item = String>,
 {
-    let mut config = Config::default();
+    let mut config = Config::load();
     let mut iter = args.into_iter();
 
     while let Some(arg) = iter.next() {
@@ -206,6 +226,8 @@ Options:\n\
 
 fn spawn_refresh_request_handler(
     config: Config,
+    shared_config: Arc<Mutex<Config>>,
+    runtime_config: RuntimeConfig,
     tx: mpsc::Sender<UiEvent>,
     state: RefreshState,
     rx: mpsc::Receiver<RefreshRequest>,
@@ -213,28 +235,43 @@ fn spawn_refresh_request_handler(
     thread::spawn(move || {
         while let Ok(request) = rx.recv() {
             match request {
-                RefreshRequest::History if config.include_browser => {
+                RefreshRequest::History if runtime_config.include_browser() => {
                     try_spawn_history_refresh(tx.clone(), state.history.clone());
                 }
-                RefreshRequest::GitHub if config.include_github => {
+                RefreshRequest::GitHub if runtime_config.include_github() => {
+                    let current = shared_config
+                        .lock()
+                        .map(|config| config.clone())
+                        .unwrap_or_else(|_| config.clone());
                     try_spawn_github_refresh(
-                        config.clone(),
+                        current,
+                        runtime_config.clone(),
                         tx.clone(),
                         state.github.clone(),
                         Duration::ZERO,
                     );
                 }
-                RefreshRequest::GitLab if config.include_gitlab => {
+                RefreshRequest::GitLab if runtime_config.include_gitlab() => {
+                    let current = shared_config
+                        .lock()
+                        .map(|config| config.clone())
+                        .unwrap_or_else(|_| config.clone());
                     try_spawn_gitlab_refresh(
-                        config.clone(),
+                        current,
+                        runtime_config.clone(),
                         tx.clone(),
                         state.gitlab.clone(),
                         Duration::ZERO,
                     );
                 }
-                RefreshRequest::DockerHub if config.include_dockerhub => {
+                RefreshRequest::DockerHub if runtime_config.include_dockerhub() => {
+                    let current = shared_config
+                        .lock()
+                        .map(|config| config.clone())
+                        .unwrap_or_else(|_| config.clone());
                     try_spawn_dockerhub_refresh(
-                        config.clone(),
+                        current,
+                        runtime_config.clone(),
                         tx.clone(),
                         state.dockerhub.clone(),
                         Duration::ZERO,
@@ -271,6 +308,7 @@ fn try_mark_refreshing(source: &str, in_progress: &AtomicBool, tx: &mpsc::Sender
 
 fn try_spawn_github_refresh(
     config: Config,
+    runtime_config: RuntimeConfig,
     tx: mpsc::Sender<UiEvent>,
     in_progress: Arc<AtomicBool>,
     delay: Duration,
@@ -281,6 +319,9 @@ fn try_spawn_github_refresh(
     thread::spawn(move || {
         let _guard = RefreshGuard(in_progress);
         thread::sleep(delay);
+        if !runtime_config.include_github() {
+            return;
+        }
         let _ = tx.send(UiEvent::Status(
             "Refreshing GitHub in background...".to_string(),
         ));
@@ -328,6 +369,7 @@ fn try_spawn_github_refresh(
 
 fn try_spawn_gitlab_refresh(
     config: Config,
+    runtime_config: RuntimeConfig,
     tx: mpsc::Sender<UiEvent>,
     in_progress: Arc<AtomicBool>,
     delay: Duration,
@@ -338,6 +380,9 @@ fn try_spawn_gitlab_refresh(
     thread::spawn(move || {
         let _guard = RefreshGuard(in_progress);
         thread::sleep(delay);
+        if !runtime_config.include_gitlab() {
+            return;
+        }
         let _ = tx.send(UiEvent::Status(
             "Refreshing GitLab in background...".to_string(),
         ));
@@ -385,6 +430,7 @@ fn try_spawn_gitlab_refresh(
 
 fn try_spawn_dockerhub_refresh(
     config: Config,
+    runtime_config: RuntimeConfig,
     tx: mpsc::Sender<UiEvent>,
     in_progress: Arc<AtomicBool>,
     delay: Duration,
@@ -395,6 +441,9 @@ fn try_spawn_dockerhub_refresh(
     thread::spawn(move || {
         let _guard = RefreshGuard(in_progress);
         thread::sleep(delay);
+        if !runtime_config.include_dockerhub() {
+            return;
+        }
         let _ = tx.send(UiEvent::Status(
             "Refreshing DockerHub in background...".to_string(),
         ));
@@ -442,6 +491,7 @@ fn try_spawn_dockerhub_refresh(
 
 fn spawn_browser_refresh(
     interval: Duration,
+    runtime_config: RuntimeConfig,
     tx: mpsc::Sender<UiEvent>,
     in_progress: Arc<AtomicBool>,
 ) {
@@ -449,6 +499,9 @@ fn spawn_browser_refresh(
         let mut last_signature = browser_source_signature();
         loop {
             thread::sleep(interval);
+            if !runtime_config.include_browser() {
+                continue;
+            }
             let Some(signature) = browser_source_signature() else {
                 continue;
             };
