@@ -179,31 +179,21 @@ pub fn parse_refresh_interval(value: &str) -> Option<Duration> {
         return None;
     }
 
-    let (number, multiplier) = if let Some(number) = value.strip_suffix("minutes") {
-        (number, 60)
-    } else if let Some(number) = value.strip_suffix("minute") {
-        (number, 60)
-    } else if let Some(number) = value.strip_suffix("mins") {
-        (number, 60)
-    } else if let Some(number) = value.strip_suffix("min") {
-        (number, 60)
-    } else if let Some(number) = value.strip_suffix('m') {
-        (number, 60)
-    } else if let Some(number) = value.strip_suffix("seconds") {
-        (number, 1)
+    let number = if let Some(number) = value.strip_suffix("seconds") {
+        number
     } else if let Some(number) = value.strip_suffix("second") {
-        (number, 1)
+        number
     } else if let Some(number) = value.strip_suffix("secs") {
-        (number, 1)
+        number
     } else if let Some(number) = value.strip_suffix("sec") {
-        (number, 1)
+        number
     } else if let Some(number) = value.strip_suffix('s') {
-        (number, 1)
+        number
     } else {
-        (value.as_str(), 1)
+        value.as_str()
     };
 
-    let seconds = number.trim().parse::<u64>().ok()?.checked_mul(multiplier)?;
+    let seconds = number.trim().parse::<u64>().ok()?;
     if seconds == 0 {
         return None;
     }
@@ -338,17 +328,18 @@ mod tests {
     #[test]
     fn parses_refresh_interval_with_units() {
         assert_eq!(parse_refresh_interval("5s"), Some(Duration::from_secs(5)));
+        assert_eq!(parse_refresh_interval("90"), Some(Duration::from_secs(90)));
         assert_eq!(
-            parse_refresh_interval("1min"),
+            parse_refresh_interval("60sec"),
             Some(Duration::from_secs(60))
         );
-        assert_eq!(parse_refresh_interval("90"), Some(Duration::from_secs(90)));
     }
 
     #[test]
-    fn rejects_empty_or_zero_refresh_interval() {
+    fn rejects_empty_zero_or_minute_refresh_interval() {
         assert_eq!(parse_refresh_interval(""), None);
         assert_eq!(parse_refresh_interval("0s"), None);
+        assert_eq!(parse_refresh_interval("1min"), None);
     }
 
     #[test]

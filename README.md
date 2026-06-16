@@ -108,11 +108,11 @@ Environment variables:
 - `DOCKERHUB_USERNAME`
 - `WEB_FZF_PREVIEW` to re-enable the preview pane (`1`, `true`, `yes`, or `on`)
 - `WEB_FZF_HISTORY_REFRESH` history refresh interval, default `5s`
-- `WEB_FZF_GITHUB_REFRESH` GitHub refresh interval, default `1min`
-- `WEB_FZF_GITLAB_REFRESH` GitLab refresh interval, default `1min`
-- `WEB_FZF_DOCKERHUB_REFRESH` DockerHub refresh interval, default `1min`
+- `WEB_FZF_GITHUB_REFRESH` GitHub refresh interval, default `60s`
+- `WEB_FZF_GITLAB_REFRESH` GitLab refresh interval, default `60s`
+- `WEB_FZF_DOCKERHUB_REFRESH` DockerHub refresh interval, default `60s`
 
-Refresh interval values may be plain seconds such as `60`, seconds such as `5s`, or minutes such as `1min`.
+Refresh interval values are seconds only, for example `60` or `5s`.
 
 DockerHub shows only public repositories when no token is provided. With a Personal Access Token (PAT), private repositories are also visible.
 

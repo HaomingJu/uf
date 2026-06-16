@@ -485,6 +485,11 @@ fn apply_action(
         Action::InsertChar(ch) if matches!(app.mode, AppMode::ConfigEdit { .. }) => {
             app.push_config_edit_char(ch)
         }
+        Action::InsertChar(ch) if app.tab == Tab::Config => {
+            if !start_inline_config_edit_with_char(app, ch) {
+                app.push_char(ch);
+            }
+        }
         Action::InsertChar(ch) => app.push_char(ch),
         Action::BackToNormal => {
             app.mode = AppMode::Normal;
@@ -498,6 +503,25 @@ fn apply_action(
         Action::CancelConfigEdit => cancel_config_edit(app),
     }
     Ok(false)
+}
+
+fn start_inline_config_edit_with_char(app: &mut AppState, ch: char) -> bool {
+    let Some(item_index) = app.selected_config_item_index() else {
+        return false;
+    };
+    let Some(item) = app.config_items.get(item_index) else {
+        return false;
+    };
+    if !config_edit_is_inline(item) || !ch.is_ascii_digit() {
+        return false;
+    }
+    app.mode = AppMode::ConfigEdit {
+        item_index,
+        buffer: ch.to_string(),
+        select_all: false,
+    };
+    app.message = "Editing refresh interval in seconds. Press Enter to save.".to_string();
+    true
 }
 
 fn open_selected_entry(app: &mut AppState) -> Result<(), String> {
@@ -560,17 +584,35 @@ fn start_config_edit(app: &mut AppState) {
         }
         ConfigEditKind::Text => {
             let current = app.config_items[item_index].current.clone();
-            let buffer = if current == "not set" {
+            let buffer = if config_edit_is_inline(&app.config_items[item_index]) {
+                current.trim_end_matches('s').to_string()
+            } else if current == "not set" {
                 String::new()
             } else {
                 current
             };
-            app.mode = AppMode::ConfigEdit { item_index, buffer };
+            if config_edit_is_inline(&app.config_items[item_index]) {
+                app.mode = AppMode::ConfigEdit {
+                    item_index,
+                    buffer,
+                    select_all: true,
+                };
+                app.message =
+                    "Type seconds here. Digits only. Press Enter to save or Esc to cancel."
+                        .to_string();
+            } else {
+                app.mode = AppMode::ConfigEdit {
+                    item_index,
+                    buffer,
+                    select_all: false,
+                };
+            }
         }
         ConfigEditKind::Secret => {
             app.mode = AppMode::ConfigEdit {
                 item_index,
                 buffer: String::new(),
+                select_all: false,
             };
             app.message = "Enter a token value; it will only be shown as present.".to_string();
         }
@@ -581,7 +623,10 @@ fn start_config_edit(app: &mut AppState) {
 }
 
 fn commit_config_edit(app: &mut AppState) {
-    let AppMode::ConfigEdit { item_index, buffer } = &app.mode else {
+    let AppMode::ConfigEdit {
+        item_index, buffer, ..
+    } = &app.mode
+    else {
         return;
     };
     let item_index = *item_index;
@@ -659,20 +704,28 @@ fn apply_config_value(
             app.config.gitlab_api = value.trim().to_string();
         }
         ("Browser", "Refresh", "Interval") => {
-            app.config.history_refresh_interval = parse_refresh_interval(value)
-                .ok_or_else(|| "Invalid browser refresh interval.".to_string())?;
+            app.config.history_refresh_interval =
+                parse_refresh_interval(value).ok_or_else(|| {
+                    "Browser refresh must be in seconds, for example 5s or 60.".to_string()
+                })?;
         }
         ("GitHub", "Refresh", "Interval") => {
-            app.config.github_refresh_interval = parse_refresh_interval(value)
-                .ok_or_else(|| "Invalid GitHub refresh interval.".to_string())?;
+            app.config.github_refresh_interval =
+                parse_refresh_interval(value).ok_or_else(|| {
+                    "GitHub refresh must be in seconds, for example 5s or 60.".to_string()
+                })?;
         }
         ("GitLab", "Refresh", "Interval") => {
-            app.config.gitlab_refresh_interval = parse_refresh_interval(value)
-                .ok_or_else(|| "Invalid GitLab refresh interval.".to_string())?;
+            app.config.gitlab_refresh_interval =
+                parse_refresh_interval(value).ok_or_else(|| {
+                    "GitLab refresh must be in seconds, for example 5s or 60.".to_string()
+                })?;
         }
         ("DockerHub", "Refresh", "Interval") => {
-            app.config.dockerhub_refresh_interval = parse_refresh_interval(value)
-                .ok_or_else(|| "Invalid DockerHub refresh interval.".to_string())?;
+            app.config.dockerhub_refresh_interval =
+                parse_refresh_interval(value).ok_or_else(|| {
+                    "DockerHub refresh must be in seconds, for example 5s or 60.".to_string()
+                })?;
         }
         _ => {}
     }
@@ -1029,7 +1082,9 @@ fn render(frame: &mut Frame<'_>, app: &mut AppState) {
         }
         AppModeKind::ConfigEdit => {
             render_config(frame, layout[2], app);
-            render_config_editor(frame, size, app);
+            if !app.config_edit_is_inline() {
+                render_config_editor(frame, size, app);
+            }
         }
         AppModeKind::Normal => {
             if app.tab == Tab::Config {
@@ -1465,14 +1520,12 @@ fn render_config(frame: &mut Frame<'_>, area: Rect, app: &AppState) {
         .border_style(Style::default().fg(Color::DarkGray));
 
     let inner_width = area.width.saturating_sub(2) as usize;
-    let level1_width = (inner_width / 7).clamp(12, 18);
-    let level3_width = (inner_width / 6).clamp(10, 18);
-    let value_width = (inner_width / 7).clamp(9, 18);
-    let detail_width = inner_width
+    let level1_width = (inner_width / 4).clamp(16, 24);
+    let level3_width = (inner_width / 4).clamp(12, 22);
+    let value_width = inner_width
         .saturating_sub(level1_width)
         .saturating_sub(level3_width)
-        .saturating_sub(value_width)
-        .saturating_sub(6);
+        .saturating_sub(4);
 
     let rows = config_display_rows(&app.config_items, &app.query);
     let height = area.height.saturating_sub(2) as usize;
@@ -1509,14 +1562,12 @@ fn render_config(frame: &mut Frame<'_>, area: Rect, app: &AppState) {
                                 .add_modifier(Modifier::BOLD),
                         ),
                         Span::raw("  "),
-                        Span::styled(
-                            "contains configurable items",
-                            Style::default().fg(Color::DarkGray),
-                        ),
+                        Span::styled("settings", Style::default().fg(Color::DarkGray)),
                     ]))
                     .style(row_style),
                     ConfigDisplayRow::Item(idx) => {
                         let item = &app.config_items[idx];
+                        let current_value = app.config_display_value(idx, item);
                         ListItem::new(Line::from(vec![
                             Span::styled(
                                 pad_or_truncate(&format!("    {}", item.level2), level1_width),
@@ -1531,13 +1582,8 @@ fn render_config(frame: &mut Frame<'_>, area: Rect, app: &AppState) {
                             ),
                             Span::raw("  "),
                             Span::styled(
-                                pad_or_truncate(&item.current, value_width),
-                                Style::default().fg(Color::Cyan),
-                            ),
-                            Span::raw("  "),
-                            Span::styled(
-                                truncate_to_width(&item.detail, detail_width),
-                                Style::default().fg(Color::Gray),
+                                pad_or_truncate(&current_value, value_width),
+                                app.config_value_style(idx),
                             ),
                         ]))
                         .style(row_style)
@@ -1563,10 +1609,25 @@ fn render_config(frame: &mut Frame<'_>, area: Rect, app: &AppState) {
         .highlight_symbol("❯ ");
 
     frame.render_stateful_widget(list, area, &mut state);
+
+    if let Some(position) = config_inline_cursor_position(
+        app,
+        area,
+        start,
+        selected_in_window,
+        row_count,
+        level1_width,
+        level3_width,
+    ) {
+        frame.set_cursor_position(position);
+    }
 }
 
 fn render_config_editor(frame: &mut Frame<'_>, area: Rect, app: &AppState) {
-    let AppMode::ConfigEdit { item_index, buffer } = &app.mode else {
+    let AppMode::ConfigEdit {
+        item_index, buffer, ..
+    } = &app.mode
+    else {
         return;
     };
     let Some(item) = app.config_items.get(*item_index) else {
@@ -1583,6 +1644,7 @@ fn render_config_editor(frame: &mut Frame<'_>, area: Rect, app: &AppState) {
     } else {
         buffer.clone()
     };
+    let value_hint = config_value_hint(item);
     let lines = vec![
         Line::from(vec![
             Span::styled("Path", Style::default().fg(Color::Cyan)),
@@ -1596,6 +1658,8 @@ fn render_config_editor(frame: &mut Frame<'_>, area: Rect, app: &AppState) {
             Span::styled("Value", Style::default().fg(Color::Cyan)),
             Span::raw(": "),
             Span::styled(value, Style::default().fg(Color::White)),
+            Span::raw("  "),
+            Span::styled(value_hint, Style::default().fg(Color::DarkGray)),
         ]),
         Line::from(Span::styled(
             "Enter=save  Esc=cancel  Backspace=delete",
@@ -1620,6 +1684,102 @@ fn render_config_editor(frame: &mut Frame<'_>, area: Rect, app: &AppState) {
             .wrap(Wrap { trim: true }),
         popup,
     );
+}
+
+fn config_value_hint(item: &ConfigItem) -> &'static str {
+    match (
+        item.level1.as_str(),
+        item.level2.as_str(),
+        item.level3.as_str(),
+    ) {
+        ("Browser", "Refresh", "Interval")
+        | ("GitHub", "Refresh", "Interval")
+        | ("GitLab", "Refresh", "Interval")
+        | ("DockerHub", "Refresh", "Interval") => "seconds only, e.g. 5s or 60",
+        ("GitHub", "API", "Base URL") | ("GitLab", "API", "Base URL") => {
+            "full URL, e.g. https://..."
+        }
+        ("GitHub", "Auth", "User") | ("DockerHub", "Auth", "Username") => "leave empty to clear",
+        ("GitHub", "Auth", "Token")
+        | ("GitLab", "Auth", "Token")
+        | ("DockerHub", "Auth", "Token") => "hidden while typing",
+        _ => "",
+    }
+}
+
+fn config_edit_is_inline(item: &ConfigItem) -> bool {
+    matches!(
+        (
+            item.level1.as_str(),
+            item.level2.as_str(),
+            item.level3.as_str(),
+            item.edit_kind,
+        ),
+        ("Browser", "Refresh", "Interval", ConfigEditKind::Text)
+            | ("GitHub", "Refresh", "Interval", ConfigEditKind::Text)
+            | ("GitLab", "Refresh", "Interval", ConfigEditKind::Text)
+            | ("DockerHub", "Refresh", "Interval", ConfigEditKind::Text)
+    )
+}
+
+fn config_inline_cursor_position(
+    app: &AppState,
+    area: Rect,
+    start: usize,
+    selected_in_window: usize,
+    row_count: usize,
+    level1_width: usize,
+    level3_width: usize,
+) -> Option<Position> {
+    let AppMode::ConfigEdit {
+        item_index,
+        buffer,
+        select_all,
+    } = &app.mode
+    else {
+        return None;
+    };
+    if !app.config_edit_is_inline() || app.tab != Tab::Config || row_count == 0 {
+        return None;
+    }
+
+    let rows = config_display_rows(&app.config_items, &app.query);
+    let selected_row = rows.get(app.selected)?;
+    let ConfigDisplayRow::Item(selected_item_index) = selected_row else {
+        return None;
+    };
+    if *selected_item_index != *item_index || app.selected < start {
+        return None;
+    }
+
+    let item = app.config_items.get(*item_index)?;
+    if !config_edit_is_inline(item) {
+        return None;
+    }
+
+    let row_y = area
+        .y
+        .saturating_add(1)
+        .saturating_add(selected_in_window as u16);
+    let value_x = area
+        .x
+        .saturating_add(1)
+        .saturating_add(2)
+        .saturating_add(level1_width as u16)
+        .saturating_add(2)
+        .saturating_add(level3_width as u16)
+        .saturating_add(2)
+        .saturating_add(1);
+    let cursor_offset = if *select_all && !buffer.is_empty() {
+        1
+    } else if buffer.is_empty() {
+        1
+    } else {
+        1 + display_width(buffer)
+    };
+    let buffer_width = cursor_offset.min(area.width.saturating_sub(4) as usize) as u16;
+
+    Some(Position::new(value_x.saturating_add(buffer_width), row_y))
 }
 
 fn source_color(source: &str) -> Color {
@@ -1942,7 +2102,6 @@ struct ConfigItem {
     level2: String,
     level3: String,
     current: String,
-    detail: String,
     haystack: String,
     edit_kind: ConfigEditKind,
 }
@@ -1969,7 +2128,6 @@ impl ConfigItem {
             level2,
             level3,
             current,
-            detail,
             haystack,
             edit_kind,
         }
@@ -2003,6 +2161,7 @@ enum AppMode {
     ConfigEdit {
         item_index: usize,
         buffer: String,
+        select_all: bool,
     },
 }
 
@@ -2259,13 +2418,38 @@ impl AppState {
     }
 
     fn push_config_edit_char(&mut self, ch: char) {
-        if let AppMode::ConfigEdit { ref mut buffer, .. } = self.mode {
+        if !self.config_edit_accepts_char(ch) {
+            if self.config_edit_is_inline() {
+                self.message = "Refresh interval accepts digits only.".to_string();
+            }
+            return;
+        }
+        if let AppMode::ConfigEdit {
+            ref mut buffer,
+            ref mut select_all,
+            ..
+        } = self.mode
+        {
+            if *select_all {
+                buffer.clear();
+                *select_all = false;
+            }
             buffer.push(ch);
         }
     }
 
     fn pop_config_edit_char(&mut self) {
-        if let AppMode::ConfigEdit { ref mut buffer, .. } = self.mode {
+        if let AppMode::ConfigEdit {
+            ref mut buffer,
+            ref mut select_all,
+            ..
+        } = self.mode
+        {
+            if *select_all {
+                buffer.clear();
+                *select_all = false;
+                return;
+            }
             if let Some(grapheme) = buffer.graphemes(true).next_back() {
                 let new_len = buffer.len().saturating_sub(grapheme.len());
                 buffer.truncate(new_len);
@@ -2385,6 +2569,63 @@ impl AppState {
         }
         self.config.save_to_disk()
     }
+
+    fn config_edit_is_inline(&self) -> bool {
+        let AppMode::ConfigEdit { item_index, .. } = self.mode else {
+            return false;
+        };
+        self.config_items
+            .get(item_index)
+            .map(config_edit_is_inline)
+            .unwrap_or(false)
+    }
+
+    fn config_edit_accepts_char(&self, ch: char) -> bool {
+        if !matches!(self.mode, AppMode::ConfigEdit { .. }) {
+            return true;
+        }
+        if self.config_edit_is_inline() {
+            ch.is_ascii_digit()
+        } else {
+            true
+        }
+    }
+
+    fn config_display_value(&self, idx: usize, item: &ConfigItem) -> String {
+        match &self.mode {
+            AppMode::ConfigEdit {
+                item_index, buffer, ..
+            } if *item_index == idx && config_edit_is_inline(item) => {
+                if buffer.is_empty() {
+                    "[ ]s".to_string()
+                } else {
+                    format!("[{}]s", buffer)
+                }
+            }
+            _ => item.current.clone(),
+        }
+    }
+
+    fn config_value_style(&self, idx: usize) -> Style {
+        match self.mode {
+            AppMode::ConfigEdit {
+                item_index,
+                select_all: true,
+                ..
+            } if item_index == idx && self.config_edit_is_inline() => Style::default()
+                .fg(Color::Black)
+                .bg(Color::White)
+                .add_modifier(Modifier::BOLD),
+            AppMode::ConfigEdit {
+                item_index,
+                select_all: false,
+                ..
+            } if item_index == idx && self.config_edit_is_inline() => {
+                Style::default().fg(Color::Black).bg(Color::Cyan)
+            }
+            _ => Style::default().fg(Color::Cyan),
+        }
+    }
 }
 
 fn build_config_items(config: &Config) -> Vec<ConfigItem> {
@@ -2494,7 +2735,7 @@ fn build_config_items(config: &Config) -> Vec<ConfigItem> {
             "Interval",
             format_duration(config.history_refresh_interval),
             "WEB_FZF_HISTORY_REFRESH",
-            "Accepts plain seconds, seconds such as 5s, or minutes such as 1min.",
+            "Seconds only. Use plain seconds such as 60, or add s such as 5s.",
             ConfigEditKind::Text,
         ),
         ConfigItem::new(
@@ -2503,7 +2744,7 @@ fn build_config_items(config: &Config) -> Vec<ConfigItem> {
             "Interval",
             format_duration(config.github_refresh_interval),
             "WEB_FZF_GITHUB_REFRESH",
-            "Remote cache is used immediately; refresh runs in the background when this interval has elapsed.",
+            "Seconds only. Remote cache is used immediately; refresh runs in the background after this many seconds.",
             ConfigEditKind::Text,
         ),
         ConfigItem::new(
@@ -2512,7 +2753,7 @@ fn build_config_items(config: &Config) -> Vec<ConfigItem> {
             "Interval",
             format_duration(config.gitlab_refresh_interval),
             "WEB_FZF_GITLAB_REFRESH",
-            "Remote cache is kept if refresh fails or returns no rows.",
+            "Seconds only. Previous cache is kept if refresh fails or returns no rows.",
             ConfigEditKind::Text,
         ),
         ConfigItem::new(
@@ -2521,7 +2762,7 @@ fn build_config_items(config: &Config) -> Vec<ConfigItem> {
             "Interval",
             format_duration(config.dockerhub_refresh_interval),
             "WEB_FZF_DOCKERHUB_REFRESH",
-            "Controls DockerHub repository cache refresh frequency.",
+            "Seconds only. Controls DockerHub repository cache refresh frequency.",
             ConfigEditKind::Text,
         ),
         ConfigItem::new(
@@ -2577,12 +2818,7 @@ fn optional_value(value: Option<&str>) -> String {
 }
 
 fn format_duration(duration: Duration) -> String {
-    let seconds = duration.as_secs();
-    if seconds >= 60 && seconds % 60 == 0 {
-        format!("{}min", seconds / 60)
-    } else {
-        format!("{seconds}s")
-    }
+    format!("{}s", duration.as_secs())
 }
 
 struct TerminalSession {
@@ -2635,13 +2871,14 @@ impl Drop for TerminalSession {
 #[cfg(test)]
 mod tests {
     use super::{
-        best_entry, commit_config_edit, config_display_rows, display_width, entry_haystacks,
-        open_selected_entry, parse_next_input_key, rank_entries, ranked_config_items,
-        resolve_action, start_config_edit, tab_count, Action, AppMode, AppModeKind, AppState,
-        ConfigDisplayRow, InputCode, InputKey, Tab,
+        apply_action, best_entry, commit_config_edit, config_display_rows, display_width,
+        entry_haystacks, open_selected_entry, parse_next_input_key, rank_entries,
+        ranked_config_items, resolve_action, start_config_edit, tab_count, Action, AppMode,
+        AppModeKind, AppState, ConfigDisplayRow, InputCode, InputKey, RefreshRequest, Tab,
     };
     use crate::config::{Config, RuntimeConfig};
     use crate::models::Entry;
+    use std::sync::mpsc;
     use std::sync::{Arc, Mutex};
 
     fn app_state(entries: Vec<Entry>) -> AppState {
@@ -3058,6 +3295,67 @@ mod tests {
         assert_eq!(item.level2, "Auth");
         assert_eq!(item.level3, "User");
         assert_eq!(item.current, "me");
+    }
+
+    #[test]
+    fn refresh_interval_supports_inline_numeric_editing() {
+        let mut app = app_state(Vec::new());
+        let (tx, _rx) = mpsc::channel::<RefreshRequest>();
+        app.tab = Tab::Config;
+        app.query = "browser interval".to_string();
+        app.recompute();
+        app.move_config_down();
+
+        apply_action(&mut app, Action::InsertChar('7'), &tx).expect("inline edit should start");
+
+        match app.mode {
+            AppMode::ConfigEdit {
+                ref buffer,
+                item_index,
+                ..
+            } => {
+                assert_eq!(buffer, "7");
+                assert!(app.config_edit_is_inline());
+                assert_eq!(app.config_items[item_index].level2, "Refresh");
+            }
+            _ => panic!("expected inline config edit"),
+        }
+
+        app.push_config_edit_char('5');
+        commit_config_edit(&mut app);
+
+        let item = &app.config_items[app.selected_config_item_index().unwrap()];
+        assert_eq!(item.current, "75s");
+    }
+
+    #[test]
+    fn enter_editing_refresh_interval_replaces_existing_digits() {
+        let mut app = app_state(Vec::new());
+        app.tab = Tab::Config;
+        app.query = "browser interval".to_string();
+        app.recompute();
+        app.move_config_down();
+
+        start_config_edit(&mut app);
+
+        match app.mode {
+            AppMode::ConfigEdit {
+                ref buffer,
+                select_all,
+                ..
+            } => {
+                assert_eq!(buffer, "5");
+                assert!(select_all);
+            }
+            _ => panic!("expected inline config edit"),
+        }
+
+        app.push_config_edit_char('4');
+        app.push_config_edit_char('3');
+        commit_config_edit(&mut app);
+
+        let item = &app.config_items[app.selected_config_item_index().unwrap()];
+        assert_eq!(item.current, "43s");
     }
 
     #[test]
