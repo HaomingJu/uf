@@ -2029,6 +2029,12 @@ const CONFIG_GROUP_ORDER: [&str; 5] = ["Browser", "GitHub", "GitLab", "DockerHub
 
 fn config_display_rows(items: &[ConfigItem], query: &str) -> Vec<ConfigDisplayRow> {
     let ranked = ranked_config_items(items, query);
+    let mut ranked_order = vec![usize::MAX; items.len()];
+    for (position, idx) in ranked.iter().copied().enumerate() {
+        if idx < ranked_order.len() {
+            ranked_order[idx] = position;
+        }
+    }
     let mut rows = Vec::new();
 
     for group in CONFIG_GROUP_ORDER {
@@ -2037,6 +2043,14 @@ fn config_display_rows(items: &[ConfigItem], query: &str) -> Vec<ConfigDisplayRo
             .copied()
             .filter(|idx| items[*idx].level1 == group)
             .collect();
+        let mut group_items = group_items;
+        group_items.sort_by_key(|idx| {
+            (
+                config_level2_order(&items[*idx].level2),
+                ranked_order[*idx],
+                *idx,
+            )
+        });
         if group_items.is_empty() {
             continue;
         }
@@ -2056,6 +2070,14 @@ fn config_display_rows(items: &[ConfigItem], query: &str) -> Vec<ConfigDisplayRo
     }
 
     rows
+}
+
+fn config_level2_order(level2: &str) -> u8 {
+    match level2 {
+        "Source" => 0,
+        "Refresh" => 1,
+        _ => 2,
+    }
 }
 
 fn entry_haystacks(entries: &[Entry]) -> Vec<String> {
@@ -3264,7 +3286,7 @@ mod tests {
 
         assert_eq!(
             github_settings,
-            vec!["Enabled", "Token", "User", "Base URL", "Interval"]
+            vec!["Enabled", "Interval", "Token", "User", "Base URL"]
         );
     }
 
@@ -3284,8 +3306,17 @@ mod tests {
 
         app.query = "github user".to_string();
         app.recompute();
-        app.selected = 0;
-        app.move_config_down();
+        let rows = config_display_rows(&app.config_items, &app.query);
+        app.selected = rows
+            .iter()
+            .position(|row| match row {
+                ConfigDisplayRow::Item(idx) => {
+                    let item = &app.config_items[*idx];
+                    item.level1 == "GitHub" && item.level2 == "Auth" && item.level3 == "User"
+                }
+                ConfigDisplayRow::Group(_) => false,
+            })
+            .unwrap();
         start_config_edit(&mut app);
         app.push_config_edit_char('m');
         app.push_config_edit_char('e');
