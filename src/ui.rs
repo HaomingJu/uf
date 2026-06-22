@@ -1,7 +1,7 @@
 use crate::config::{parse_refresh_interval, Config, RuntimeConfig};
 use crate::matchers::FuzzyMatcher;
 use crate::models::Entry;
-use crate::sources::{dockerhub_entry_description, dockerhub_entry_tags};
+use crate::sources::{dockerhub_entry_description, dockerhub_entry_tags, test_github_connectivity};
 use crossterm::cursor::{Hide, Show};
 use crossterm::execute;
 use crossterm::terminal::{EnterAlternateScreen, LeaveAlternateScreen};
@@ -9,6 +9,7 @@ use ratatui::backend::CrosstermBackend;
 use ratatui::prelude::*;
 use ratatui::widgets::{Block, Borders, Clear, List, ListItem, ListState, Paragraph, Tabs, Wrap};
 use std::cmp::Ordering;
+use std::collections::HashSet;
 use std::io::{self, IsTerminal, Read};
 use std::process::Command;
 use std::sync::mpsc::{Receiver, Sender, TryRecvError};
@@ -28,6 +29,11 @@ pub enum UiEvent {
         entries: Vec<Entry>,
     },
     Status(String),
+    ConnectResult {
+        item_index: usize,
+        current: String,
+        message: String,
+    },
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -43,6 +49,7 @@ pub fn run_ui(
     config: Config,
     runtime_config: RuntimeConfig,
     shared_config: Arc<Mutex<Config>>,
+    event_tx: Sender<UiEvent>,
     events: Receiver<UiEvent>,
     refresh_requests: Sender<RefreshRequest>,
 ) -> Result<(), String> {
@@ -51,7 +58,7 @@ pub fn run_ui(
     }
 
     let mut session = TerminalSession::enter()?;
-    let mut app = AppState::new(entries, config, runtime_config, shared_config);
+    let mut app = AppState::new(entries, config, runtime_config, shared_config, event_tx);
     let mut terminal = Terminal::new(CrosstermBackend::new(io::stdout()))
         .map_err(|err| format!("create terminal: {err}"))?;
     let mut last_cursor_toggle = Instant::now();
@@ -136,6 +143,14 @@ fn drain_events(app: &mut AppState, events: &Receiver<UiEvent>) {
                 app.message = format!("Browser data refreshed ({count} items).");
             }
             Ok(UiEvent::Status(message)) => {
+                app.message = message;
+            }
+            Ok(UiEvent::ConnectResult {
+                item_index,
+                current,
+                message,
+            }) => {
+                update_config_item_current(app, item_index, &current);
                 app.message = message;
             }
             Err(TryRecvError::Empty) | Err(TryRecvError::Disconnected) => break,
@@ -338,6 +353,11 @@ enum Action {
     ConfirmRepoAction,
     CommitConfigEdit,
     CancelConfigEdit,
+    ConfigEditCursorLeft,
+    ConfigEditCursorRight,
+    ConfigEditCursorHome,
+    ConfigEditCursorEnd,
+    ConfigEditClear,
 }
 
 fn resolve_action(mode: AppModeKind, key: InputKey) -> Option<Action> {
@@ -441,6 +461,11 @@ fn resolve_config_edit_action(key: InputKey) -> Option<Action> {
         InputCode::Esc => Some(Action::CancelConfigEdit),
         InputCode::Enter => Some(Action::CommitConfigEdit),
         InputCode::Backspace => Some(Action::Backspace),
+        InputCode::Left => Some(Action::ConfigEditCursorLeft),
+        InputCode::Right => Some(Action::ConfigEditCursorRight),
+        InputCode::Home => Some(Action::ConfigEditCursorHome),
+        InputCode::End => Some(Action::ConfigEditCursorEnd),
+        InputCode::Char('u') if key.ctrl => Some(Action::ConfigEditClear),
         InputCode::Char(c) if !key.ctrl => Some(Action::InsertChar(c)),
         _ => None,
     }
@@ -485,11 +510,6 @@ fn apply_action(
         Action::InsertChar(ch) if matches!(app.mode, AppMode::ConfigEdit { .. }) => {
             app.push_config_edit_char(ch)
         }
-        Action::InsertChar(ch) if app.tab == Tab::Config => {
-            if !start_inline_config_edit_with_char(app, ch) {
-                app.push_char(ch);
-            }
-        }
         Action::InsertChar(ch) => app.push_char(ch),
         Action::BackToNormal => {
             app.mode = AppMode::Normal;
@@ -501,27 +521,13 @@ fn apply_action(
         Action::ConfirmRepoAction => confirm_repo_action(app)?,
         Action::CommitConfigEdit => commit_config_edit(app),
         Action::CancelConfigEdit => cancel_config_edit(app),
+        Action::ConfigEditCursorLeft => app.config_edit_cursor_left(),
+        Action::ConfigEditCursorRight => app.config_edit_cursor_right(),
+        Action::ConfigEditCursorHome => app.config_edit_cursor_home(),
+        Action::ConfigEditCursorEnd => app.config_edit_cursor_end(),
+        Action::ConfigEditClear => app.config_edit_clear(),
     }
     Ok(false)
-}
-
-fn start_inline_config_edit_with_char(app: &mut AppState, ch: char) -> bool {
-    let Some(item_index) = app.selected_config_item_index() else {
-        return false;
-    };
-    let Some(item) = app.config_items.get(item_index) else {
-        return false;
-    };
-    if !config_edit_is_inline(item) || !ch.is_ascii_digit() {
-        return false;
-    }
-    app.mode = AppMode::ConfigEdit {
-        item_index,
-        buffer: ch.to_string(),
-        select_all: false,
-    };
-    app.message = "Editing refresh interval in seconds. Press Enter to save.".to_string();
-    true
 }
 
 fn open_selected_entry(app: &mut AppState) -> Result<(), String> {
@@ -560,7 +566,10 @@ fn open_selected_entry(app: &mut AppState) -> Result<(), String> {
 
 fn start_config_edit(app: &mut AppState) {
     let Some(item_index) = app.selected_config_item_index() else {
-        app.message = "Select an indented config item to edit.".to_string();
+        // 选中的是 Group/Subgroup 标题行：切换折叠
+        if !app.toggle_selected_config_collapse() {
+            app.message = "Select a config item to edit.".to_string();
+        }
         return;
     };
     let edit_kind = app.config_items[item_index].edit_kind;
@@ -582,43 +591,87 @@ fn start_config_edit(app: &mut AppState) {
             app.message = format!("Updated {} / {} / {}.", level1, level2, level3);
             app.recompute();
         }
-        ConfigEditKind::Text => {
-            let current = app.config_items[item_index].current.clone();
-            let buffer = if config_edit_is_inline(&app.config_items[item_index]) {
-                current.trim_end_matches('s').to_string()
-            } else if current == "not set" {
-                String::new()
-            } else {
-                current
-            };
-            if config_edit_is_inline(&app.config_items[item_index]) {
-                app.mode = AppMode::ConfigEdit {
-                    item_index,
-                    buffer,
-                    select_all: true,
-                };
-                app.message =
-                    "Type seconds here. Digits only. Press Enter to save or Esc to cancel."
-                        .to_string();
-            } else {
-                app.mode = AppMode::ConfigEdit {
-                    item_index,
-                    buffer,
-                    select_all: false,
-                };
-            }
-        }
-        ConfigEditKind::Secret => {
+        ConfigEditKind::Text | ConfigEditKind::Secret => {
+            let hint = config_value_hint(&app.config_items[item_index]);
             app.mode = AppMode::ConfigEdit {
                 item_index,
                 buffer: String::new(),
-                select_all: false,
+                cursor: 0,
             };
-            app.message = "Enter a token value; it will only be shown as present.".to_string();
+            app.message = if hint.is_empty() {
+                "Type a new value. Enter to save, Esc to cancel.".to_string()
+            } else {
+                format!("Type a new value ({hint}). Enter to save, Esc to cancel.")
+            };
         }
         ConfigEditKind::ReadOnly => {
+            match handle_config_read_only_action(app, item_index) {
+                Ok(true) => return,
+                Ok(false) => {}
+                Err(err) => {
+                    app.message = err;
+                    return;
+                }
+            }
             app.message = "This config item is informational.".to_string();
         }
+    }
+}
+
+fn handle_config_read_only_action(app: &mut AppState, item_index: usize) -> Result<bool, String> {
+    let Some(item) = app.config_items.get(item_index) else {
+        return Ok(false);
+    };
+
+    match (
+        item.level1.as_str(),
+        item.level2.as_str(),
+        item.level3.as_str(),
+    ) {
+        ("GitHub", "Auth", "Open token page") => {
+            let entry = Entry::new(
+                "GitHub token settings",
+                "https://github.com/settings/tokens",
+                "config",
+                "",
+            );
+            open_entry(&entry)?;
+            app.message = "Opened GitHub token settings in browser.".to_string();
+            Ok(true)
+        }
+        ("GitHub", "Auth", "Connect") => {
+            let config = app.config.clone();
+            let tx = app.event_tx.clone();
+            update_config_item_current(app, item_index, "testing...");
+            app.message = "Testing GitHub connectivity...".to_string();
+            std::thread::spawn(move || {
+                let (current, message) = match test_github_connectivity(&config) {
+                    Ok(msg) => ("ok".to_string(), msg),
+                    Err(err) => {
+                        let current = if config.github_token.is_some() {
+                            "failed"
+                        } else {
+                            "missing"
+                        };
+                        (current.to_string(), err)
+                    }
+                };
+                let _ = tx.send(UiEvent::ConnectResult {
+                    item_index,
+                    current,
+                    message,
+                });
+            });
+            Ok(true)
+        }
+        _ => Ok(false),
+    }
+}
+
+fn update_config_item_current(app: &mut AppState, item_index: usize, current: &str) {
+    if let Some(item) = app.config_items.get_mut(item_index) {
+        item.current = current.to_string();
+        item.refresh_haystack();
     }
 }
 
@@ -1082,9 +1135,7 @@ fn render(frame: &mut Frame<'_>, app: &mut AppState) {
         }
         AppModeKind::ConfigEdit => {
             render_config(frame, layout[2], app);
-            if !app.config_edit_is_inline() {
-                render_config_editor(frame, size, app);
-            }
+            render_config_editor(frame, size, app);
         }
         AppModeKind::Normal => {
             if app.tab == Tab::Config {
@@ -1392,7 +1443,7 @@ fn render_footer(frame: &mut Frame<'_>, area: Rect, app: &AppState) {
         AppMode::ConfigEdit { .. } => "Type=value  Enter=save  Esc=cancel  Backspace=delete",
         AppMode::Normal => {
             if app.tab == Tab::Config {
-                "Up/Down=select  Enter=edit/toggle  Type=filter  Ctrl+B=hide Config  Esc=quit"
+                "Up/Down=select  Enter=edit/toggle/fold  Type=filter  Ctrl+B=hide Config  Esc=quit"
             } else if app.query.is_empty() {
                 "Enter=open  Ctrl+U/D=page  Ctrl+R=refresh tab  Ctrl+B=toggle Config  Esc=quit"
             } else {
@@ -1527,7 +1578,16 @@ fn render_config(frame: &mut Frame<'_>, area: Rect, app: &AppState) {
         .saturating_sub(level3_width)
         .saturating_sub(4);
 
-    let rows = config_display_rows(&app.config_items, &app.query);
+    let rows = app.config_rows();
+    // 记录每行所属的 Group 名，供 Subgroup 行查询折叠 key
+    let mut row_groups: Vec<String> = Vec::with_capacity(rows.len());
+    let mut current_group = String::new();
+    for row in &rows {
+        if let ConfigDisplayRow::Group(group) = row {
+            current_group = group.clone();
+        }
+        row_groups.push(current_group.clone());
+    }
     let height = area.height.saturating_sub(2) as usize;
     let row_count = rows.len();
     let selected = app.selected.min(row_count.saturating_sub(1));
@@ -1554,36 +1614,56 @@ fn render_config(frame: &mut Frame<'_>, area: Rect, app: &AppState) {
                     ROW_ODD_BG
                 });
                 match idx {
-                    ConfigDisplayRow::Group(group) => ListItem::new(Line::from(vec![
-                        Span::styled(
-                            pad_or_truncate(&format!("▼ {group}"), level1_width),
+                    ConfigDisplayRow::Group(group) => {
+                        let collapsed = app
+                            .config_collapsed
+                            .contains(&config_group_key(&group))
+                            && app.query.is_empty();
+                        let arrow = if collapsed { "▶" } else { "▼" };
+                        ListItem::new(Line::from(vec![Span::styled(
+                            pad_or_truncate(&format!("{arrow} {group}"), level1_width),
                             Style::default()
                                 .fg(Color::Green)
                                 .add_modifier(Modifier::BOLD),
-                        ),
-                        Span::raw("  "),
-                        Span::styled("settings", Style::default().fg(Color::DarkGray)),
-                    ]))
-                    .style(row_style),
+                        )]))
+                        .style(row_style)
+                    }
+                    ConfigDisplayRow::Subgroup(group) => {
+                        let parent = row_groups.get(start + row).cloned().unwrap_or_default();
+                        let collapsed = app
+                            .config_collapsed
+                            .contains(&config_subgroup_key(&parent, &group))
+                            && app.query.is_empty();
+                        let arrow = if collapsed { "▸" } else { "▾" };
+                        ListItem::new(Line::from(vec![Span::styled(
+                            pad_or_truncate(&format!("  {arrow} {group}"), level1_width),
+                            Style::default()
+                                .fg(Color::Yellow)
+                                .add_modifier(Modifier::BOLD),
+                        )]))
+                        .style(row_style)
+                    }
                     ConfigDisplayRow::Item(idx) => {
                         let item = &app.config_items[idx];
-                        let current_value = app.config_display_value(idx, item);
+                        let current_value = item.current.clone();
+                        let setting_label = if item.level2 == "Auth" {
+                            format!("      {}", item.level3)
+                        } else {
+                            format!("  {}", item.level3)
+                        };
                         ListItem::new(Line::from(vec![
                             Span::styled(
-                                pad_or_truncate(&format!("    {}", item.level2), level1_width),
-                                Style::default().fg(Color::Yellow),
-                            ),
-                            Span::raw("  "),
-                            Span::styled(
-                                pad_or_truncate(&item.level3, level3_width),
+                                pad_or_truncate(&setting_label, level1_width),
                                 Style::default()
                                     .fg(Color::White)
                                     .add_modifier(Modifier::BOLD),
                             ),
                             Span::raw("  "),
+                            Span::styled(pad_or_truncate("", level3_width), Style::default()),
+                            Span::raw(""),
                             Span::styled(
                                 pad_or_truncate(&current_value, value_width),
-                                app.config_value_style(idx),
+                                app.config_value_style(item),
                             ),
                         ]))
                         .style(row_style)
@@ -1609,23 +1689,13 @@ fn render_config(frame: &mut Frame<'_>, area: Rect, app: &AppState) {
         .highlight_symbol("❯ ");
 
     frame.render_stateful_widget(list, area, &mut state);
-
-    if let Some(position) = config_inline_cursor_position(
-        app,
-        area,
-        start,
-        selected_in_window,
-        row_count,
-        level1_width,
-        level3_width,
-    ) {
-        frame.set_cursor_position(position);
-    }
 }
 
 fn render_config_editor(frame: &mut Frame<'_>, area: Rect, app: &AppState) {
     let AppMode::ConfigEdit {
-        item_index, buffer, ..
+        item_index,
+        buffer,
+        cursor,
     } = &app.mode
     else {
         return;
@@ -1634,25 +1704,40 @@ fn render_config_editor(frame: &mut Frame<'_>, area: Rect, app: &AppState) {
         return;
     };
 
+    let is_secret = item.edit_kind == ConfigEditKind::Secret;
     let width = area.width.min(90).max(40);
-    let height = 7;
+    let height = 8;
     let x = area.x + area.width.saturating_sub(width) / 2;
     let y = area.y + area.height.saturating_sub(height) / 2;
     let popup = Rect::new(x, y, width, height);
-    let value = if item.edit_kind == ConfigEditKind::Secret {
+
+    let value = if is_secret {
         "*".repeat(buffer.chars().count())
     } else {
         buffer.clone()
     };
     let value_hint = config_value_hint(item);
+    // "Value" 行前缀宽度："Value" + ": " = 7 列
+    let value_label_cols = display_width("Value") + 2;
+    let cursor_cols = if is_secret {
+        buffer[..(*cursor).min(buffer.len())].chars().count()
+    } else {
+        display_width(&buffer[..(*cursor).min(buffer.len())])
+    };
+
     let lines = vec![
         Line::from(vec![
             Span::styled("Path", Style::default().fg(Color::Cyan)),
-            Span::raw(": "),
+            Span::raw(":  "),
             Span::styled(
                 format!("{} / {} / {}", item.level1, item.level2, item.level3),
                 Style::default().fg(Color::White),
             ),
+        ]),
+        Line::from(vec![
+            Span::styled("Now", Style::default().fg(Color::Cyan)),
+            Span::raw(":    "),
+            Span::styled(item.current.clone(), Style::default().fg(Color::DarkGray)),
         ]),
         Line::from(vec![
             Span::styled("Value", Style::default().fg(Color::Cyan)),
@@ -1662,28 +1747,38 @@ fn render_config_editor(frame: &mut Frame<'_>, area: Rect, app: &AppState) {
             Span::styled(value_hint, Style::default().fg(Color::DarkGray)),
         ]),
         Line::from(Span::styled(
-            "Enter=save  Esc=cancel  Backspace=delete",
+            "Enter=save  Esc=cancel  ←→=move  Ctrl+U=clear",
             Style::default().fg(Color::DarkGray),
         )),
     ];
 
     frame.render_widget(Clear, popup);
     frame.render_widget(
-        Paragraph::new(lines)
-            .block(
-                Block::default()
-                    .title(Span::styled(
-                        " Edit Config ",
-                        Style::default()
-                            .fg(Color::Cyan)
-                            .add_modifier(Modifier::BOLD),
-                    ))
-                    .borders(Borders::ALL)
-                    .border_style(Style::default().fg(Color::Cyan)),
-            )
-            .wrap(Wrap { trim: true }),
+        Paragraph::new(lines).block(
+            Block::default()
+                .title(Span::styled(
+                    " Edit Config ",
+                    Style::default()
+                        .fg(Color::Cyan)
+                        .add_modifier(Modifier::BOLD),
+                ))
+                .borders(Borders::ALL)
+                .border_style(Style::default().fg(Color::Cyan)),
+        ),
         popup,
     );
+
+    // 光标位于 Value 行（popup 内第 3 行内容，含上边框偏移 1）
+    let value_row_y = popup.y.saturating_add(1).saturating_add(2);
+    let value_start_x = popup
+        .x
+        .saturating_add(1)
+        .saturating_add(value_label_cols as u16);
+    let max_cursor_x = popup.x + popup.width.saturating_sub(2);
+    let cursor_x = value_start_x
+        .saturating_add(cursor_cols as u16)
+        .min(max_cursor_x);
+    frame.set_cursor_position(Position::new(cursor_x, value_row_y));
 }
 
 fn config_value_hint(item: &ConfigItem) -> &'static str {
@@ -1707,79 +1802,8 @@ fn config_value_hint(item: &ConfigItem) -> &'static str {
     }
 }
 
-fn config_edit_is_inline(item: &ConfigItem) -> bool {
-    matches!(
-        (
-            item.level1.as_str(),
-            item.level2.as_str(),
-            item.level3.as_str(),
-            item.edit_kind,
-        ),
-        ("Browser", "Refresh", "Interval", ConfigEditKind::Text)
-            | ("GitHub", "Refresh", "Interval", ConfigEditKind::Text)
-            | ("GitLab", "Refresh", "Interval", ConfigEditKind::Text)
-            | ("DockerHub", "Refresh", "Interval", ConfigEditKind::Text)
-    )
-}
-
-fn config_inline_cursor_position(
-    app: &AppState,
-    area: Rect,
-    start: usize,
-    selected_in_window: usize,
-    row_count: usize,
-    level1_width: usize,
-    level3_width: usize,
-) -> Option<Position> {
-    let AppMode::ConfigEdit {
-        item_index,
-        buffer,
-        select_all,
-    } = &app.mode
-    else {
-        return None;
-    };
-    if !app.config_edit_is_inline() || app.tab != Tab::Config || row_count == 0 {
-        return None;
-    }
-
-    let rows = config_display_rows(&app.config_items, &app.query);
-    let selected_row = rows.get(app.selected)?;
-    let ConfigDisplayRow::Item(selected_item_index) = selected_row else {
-        return None;
-    };
-    if *selected_item_index != *item_index || app.selected < start {
-        return None;
-    }
-
-    let item = app.config_items.get(*item_index)?;
-    if !config_edit_is_inline(item) {
-        return None;
-    }
-
-    let row_y = area
-        .y
-        .saturating_add(1)
-        .saturating_add(selected_in_window as u16);
-    let value_x = area
-        .x
-        .saturating_add(1)
-        .saturating_add(2)
-        .saturating_add(level1_width as u16)
-        .saturating_add(2)
-        .saturating_add(level3_width as u16)
-        .saturating_add(2)
-        .saturating_add(1);
-    let cursor_offset = if *select_all && !buffer.is_empty() {
-        1
-    } else if buffer.is_empty() {
-        1
-    } else {
-        1 + display_width(buffer)
-    };
-    let buffer_width = cursor_offset.min(area.width.saturating_sub(4) as usize) as u16;
-
-    Some(Position::new(value_x.saturating_add(buffer_width), row_y))
+fn config_edit_is_refresh_interval(item: &ConfigItem) -> bool {
+    item.level2 == "Refresh" && item.level3 == "Interval"
 }
 
 fn source_color(source: &str) -> Color {
@@ -1991,6 +2015,7 @@ fn ranked_config_items(items: &[ConfigItem], query: &str) -> Vec<usize> {
     }
 
     let normalized_query = query.to_ascii_lowercase();
+    let query_terms: Vec<&str> = normalized_query.split_whitespace().collect();
     let mut matcher = FuzzyMatcher::new(query);
     let mut ranked: Vec<(i64, usize)> = items
         .iter()
@@ -1999,15 +2024,21 @@ fn ranked_config_items(items: &[ConfigItem], query: &str) -> Vec<usize> {
             matcher.score(&item.haystack).map(|m| {
                 let path =
                     format!("{} {} {}", item.level1, item.level2, item.level3).to_ascii_lowercase();
-                let query_terms_match_path = normalized_query
-                    .split_whitespace()
-                    .all(|term| path.contains(term));
+                let query_terms_match_path = query_terms.iter().all(|term| path.contains(term));
                 let name_boost = if path.contains(&normalized_query) || query_terms_match_path {
                     10_000
                 } else {
                     0
                 };
-                (m.score + name_boost, idx)
+                let exact_field_boost = if query_terms
+                    .iter()
+                    .any(|term| item.level3.eq_ignore_ascii_case(term))
+                {
+                    2_000
+                } else {
+                    0
+                };
+                (m.score + name_boost + exact_field_boost, idx)
             })
         })
         .collect();
@@ -2022,12 +2053,34 @@ fn ranked_config_items(items: &[ConfigItem], query: &str) -> Vec<usize> {
 #[derive(Clone, Debug, Eq, PartialEq)]
 enum ConfigDisplayRow {
     Group(String),
+    Subgroup(String),
     Item(usize),
 }
 
 const CONFIG_GROUP_ORDER: [&str; 5] = ["Browser", "GitHub", "GitLab", "DockerHub", "System"];
 
+fn config_group_key(group: &str) -> String {
+    group.to_string()
+}
+
+fn config_subgroup_key(group: &str, subgroup: &str) -> String {
+    format!("{group}/{subgroup}")
+}
+
+#[cfg(test)]
 fn config_display_rows(items: &[ConfigItem], query: &str) -> Vec<ConfigDisplayRow> {
+    config_display_rows_with_collapsed(items, query, &HashSet::new())
+}
+
+fn config_display_rows_with_collapsed(
+    items: &[ConfigItem],
+    query: &str,
+    collapsed: &HashSet<String>,
+) -> Vec<ConfigDisplayRow> {
+    // 搜索时忽略折叠状态，保证匹配项始终可见
+    let honor_collapsed = query.is_empty();
+    let is_collapsed = |key: &str| honor_collapsed && collapsed.contains(key);
+
     let ranked = ranked_config_items(items, query);
     let mut ranked_order = vec![usize::MAX; items.len()];
     for (position, idx) in ranked.iter().copied().enumerate() {
@@ -2054,8 +2107,39 @@ fn config_display_rows(items: &[ConfigItem], query: &str) -> Vec<ConfigDisplayRo
         if group_items.is_empty() {
             continue;
         }
+        let group_collapsed = is_collapsed(&config_group_key(group));
         rows.push(ConfigDisplayRow::Group(group.to_string()));
-        rows.extend(group_items.into_iter().map(ConfigDisplayRow::Item));
+        if group_collapsed {
+            continue;
+        }
+        let mut current_level2: Option<String> = None;
+        let mut subgroup_collapsed = false;
+        for idx in group_items {
+            let level2 = items[idx].level2.clone();
+            if current_level2.as_deref() != Some(level2.as_str()) {
+                current_level2 = Some(level2.clone());
+            }
+            if level2 == "Auth" {
+                let just_started_auth = matches!(current_level2.as_deref(), Some("Auth"))
+                    && !matches!(
+                        rows.last(),
+                        Some(ConfigDisplayRow::Subgroup(name)) if name == "Auth"
+                    )
+                    && !matches!(
+                        rows.last(),
+                        Some(ConfigDisplayRow::Item(prev_idx))
+                            if items[*prev_idx].level1 == group && items[*prev_idx].level2 == "Auth"
+                    );
+                if just_started_auth {
+                    subgroup_collapsed = is_collapsed(&config_subgroup_key(group, "Auth"));
+                    rows.push(ConfigDisplayRow::Subgroup(level2));
+                }
+                if subgroup_collapsed {
+                    continue;
+                }
+            }
+            rows.push(ConfigDisplayRow::Item(idx));
+        }
     }
 
     for idx in ranked {
@@ -2065,7 +2149,18 @@ fn config_display_rows(items: &[ConfigItem], query: &str) -> Vec<ConfigDisplayRo
         {
             continue;
         }
-        rows.push(ConfigDisplayRow::Group(items[idx].level1.clone()));
+        let group = items[idx].level1.clone();
+        let group_collapsed = is_collapsed(&config_group_key(&group));
+        rows.push(ConfigDisplayRow::Group(group.clone()));
+        if group_collapsed {
+            continue;
+        }
+        if items[idx].level2 == "Auth" {
+            rows.push(ConfigDisplayRow::Subgroup(items[idx].level2.clone()));
+            if is_collapsed(&config_subgroup_key(&group, "Auth")) {
+                continue;
+            }
+        }
         rows.push(ConfigDisplayRow::Item(idx));
     }
 
@@ -2106,6 +2201,7 @@ struct AppState {
     config_items: Vec<ConfigItem>,
     runtime_config: RuntimeConfig,
     shared_config: Arc<Mutex<Config>>,
+    event_tx: Sender<UiEvent>,
     visible: Vec<usize>,
     query: String,
     selected: usize,
@@ -2117,6 +2213,7 @@ struct AppState {
     cursor_visible: bool,
     mode: AppMode,
     dirty: bool,
+    config_collapsed: HashSet<String>,
 }
 
 struct ConfigItem {
@@ -2154,6 +2251,13 @@ impl ConfigItem {
             edit_kind,
         }
     }
+
+    fn refresh_haystack(&mut self) {
+        self.haystack = format!(
+            "{} {} {} {}",
+            self.level1, self.level2, self.level3, self.current
+        );
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -2183,7 +2287,7 @@ enum AppMode {
     ConfigEdit {
         item_index: usize,
         buffer: String,
-        select_all: bool,
+        cursor: usize,
     },
 }
 
@@ -2212,6 +2316,7 @@ impl AppState {
         config: Config,
         runtime_config: RuntimeConfig,
         shared_config: Arc<Mutex<Config>>,
+        event_tx: Sender<UiEvent>,
     ) -> Self {
         let haystacks = entry_haystacks(&entries);
         let config_items = build_config_items(&config);
@@ -2222,6 +2327,7 @@ impl AppState {
             config_items,
             runtime_config,
             shared_config,
+            event_tx,
             visible: Vec::new(),
             query: String::new(),
             selected: 0,
@@ -2233,6 +2339,7 @@ impl AppState {
             cursor_visible: true,
             mode: AppMode::Normal,
             dirty: false,
+            config_collapsed: HashSet::new(),
         };
         app.recompute();
         app
@@ -2271,12 +2378,55 @@ impl AppState {
             .and_then(|idx| self.entries.get(*idx))
     }
 
+    fn config_rows(&self) -> Vec<ConfigDisplayRow> {
+        config_display_rows_with_collapsed(&self.config_items, &self.query, &self.config_collapsed)
+    }
+
     fn selected_config_item_index(&self) -> Option<usize> {
-        config_display_rows(&self.config_items, &self.query)
+        self.config_rows()
             .get(self.selected)
             .and_then(|row| match row {
                 ConfigDisplayRow::Group(_) => None,
+                ConfigDisplayRow::Subgroup(_) => None,
                 ConfigDisplayRow::Item(idx) => Some(*idx),
+            })
+    }
+
+    // 选中行若是 Group/Subgroup 标题，切换其折叠状态并返回 true
+    fn toggle_selected_config_collapse(&mut self) -> bool {
+        let Some(row) = self.config_rows().get(self.selected).cloned() else {
+            return false;
+        };
+        let key = match &row {
+            ConfigDisplayRow::Group(group) => config_group_key(group),
+            ConfigDisplayRow::Subgroup(subgroup) => {
+                let Some(group) = self.group_for_subgroup_row(self.selected) else {
+                    return false;
+                };
+                config_subgroup_key(&group, subgroup)
+            }
+            ConfigDisplayRow::Item(_) => return false,
+        };
+        if self.config_collapsed.contains(&key) {
+            self.config_collapsed.remove(&key);
+            self.message = format!("Expanded {key}.");
+        } else {
+            self.config_collapsed.insert(key.clone());
+            self.message = format!("Collapsed {key}.");
+        }
+        self.selected = self.selected.min(self.config_result_count().saturating_sub(1));
+        true
+    }
+
+    // 向上回溯找到 Subgroup 行所属的 Group 名
+    fn group_for_subgroup_row(&self, row_index: usize) -> Option<String> {
+        let rows = self.config_rows();
+        rows[..=row_index.min(rows.len().saturating_sub(1))]
+            .iter()
+            .rev()
+            .find_map(|row| match row {
+                ConfigDisplayRow::Group(group) => Some(group.clone()),
+                _ => None,
             })
     }
 
@@ -2412,7 +2562,7 @@ impl AppState {
     }
 
     fn config_result_count(&self) -> usize {
-        config_display_rows(&self.config_items, &self.query).len()
+        self.config_rows().len()
     }
 
     fn move_config_up(&mut self) {
@@ -2440,42 +2590,95 @@ impl AppState {
     }
 
     fn push_config_edit_char(&mut self, ch: char) {
-        if !self.config_edit_accepts_char(ch) {
-            if self.config_edit_is_inline() {
-                self.message = "Refresh interval accepts digits only.".to_string();
-            }
+        if self.config_edit_is_refresh_mode() && !ch.is_ascii_digit() {
+            self.message = "Refresh interval accepts digits only.".to_string();
             return;
         }
         if let AppMode::ConfigEdit {
             ref mut buffer,
-            ref mut select_all,
+            ref mut cursor,
             ..
         } = self.mode
         {
-            if *select_all {
-                buffer.clear();
-                *select_all = false;
-            }
-            buffer.push(ch);
+            let at = (*cursor).min(buffer.len());
+            buffer.insert(at, ch);
+            *cursor = at + ch.len_utf8();
         }
     }
 
     fn pop_config_edit_char(&mut self) {
         if let AppMode::ConfigEdit {
             ref mut buffer,
-            ref mut select_all,
+            ref mut cursor,
             ..
         } = self.mode
         {
-            if *select_all {
-                buffer.clear();
-                *select_all = false;
+            let at = (*cursor).min(buffer.len());
+            if at == 0 {
                 return;
             }
-            if let Some(grapheme) = buffer.graphemes(true).next_back() {
-                let new_len = buffer.len().saturating_sub(grapheme.len());
-                buffer.truncate(new_len);
+            if let Some(grapheme) = buffer[..at].graphemes(true).next_back() {
+                let start = at - grapheme.len();
+                buffer.replace_range(start..at, "");
+                *cursor = start;
             }
+        }
+    }
+
+    fn config_edit_cursor_left(&mut self) {
+        if let AppMode::ConfigEdit {
+            ref buffer,
+            ref mut cursor,
+            ..
+        } = self.mode
+        {
+            let at = (*cursor).min(buffer.len());
+            if let Some(grapheme) = buffer[..at].graphemes(true).next_back() {
+                *cursor = at - grapheme.len();
+            }
+        }
+    }
+
+    fn config_edit_cursor_right(&mut self) {
+        if let AppMode::ConfigEdit {
+            ref buffer,
+            ref mut cursor,
+            ..
+        } = self.mode
+        {
+            let at = (*cursor).min(buffer.len());
+            if let Some(grapheme) = buffer[at..].graphemes(true).next() {
+                *cursor = at + grapheme.len();
+            }
+        }
+    }
+
+    fn config_edit_cursor_home(&mut self) {
+        if let AppMode::ConfigEdit { ref mut cursor, .. } = self.mode {
+            *cursor = 0;
+        }
+    }
+
+    fn config_edit_cursor_end(&mut self) {
+        if let AppMode::ConfigEdit {
+            ref buffer,
+            ref mut cursor,
+            ..
+        } = self.mode
+        {
+            *cursor = buffer.len();
+        }
+    }
+
+    fn config_edit_clear(&mut self) {
+        if let AppMode::ConfigEdit {
+            ref mut buffer,
+            ref mut cursor,
+            ..
+        } = self.mode
+        {
+            buffer.clear();
+            *cursor = 0;
         }
     }
 
@@ -2592,59 +2795,26 @@ impl AppState {
         self.config.save_to_disk()
     }
 
-    fn config_edit_is_inline(&self) -> bool {
+    fn config_edit_is_refresh_mode(&self) -> bool {
         let AppMode::ConfigEdit { item_index, .. } = self.mode else {
             return false;
         };
         self.config_items
             .get(item_index)
-            .map(config_edit_is_inline)
+            .map(config_edit_is_refresh_interval)
             .unwrap_or(false)
     }
 
-    fn config_edit_accepts_char(&self, ch: char) -> bool {
-        if !matches!(self.mode, AppMode::ConfigEdit { .. }) {
-            return true;
-        }
-        if self.config_edit_is_inline() {
-            ch.is_ascii_digit()
-        } else {
-            true
-        }
-    }
-
-    fn config_display_value(&self, idx: usize, item: &ConfigItem) -> String {
-        match &self.mode {
-            AppMode::ConfigEdit {
-                item_index, buffer, ..
-            } if *item_index == idx && config_edit_is_inline(item) => {
-                if buffer.is_empty() {
-                    "[ ]s".to_string()
-                } else {
-                    format!("[{}]s", buffer)
-                }
-            }
-            _ => item.current.clone(),
-        }
-    }
-
-    fn config_value_style(&self, idx: usize) -> Style {
-        match self.mode {
-            AppMode::ConfigEdit {
-                item_index,
-                select_all: true,
-                ..
-            } if item_index == idx && self.config_edit_is_inline() => Style::default()
-                .fg(Color::Black)
-                .bg(Color::White)
-                .add_modifier(Modifier::BOLD),
-            AppMode::ConfigEdit {
-                item_index,
-                select_all: false,
-                ..
-            } if item_index == idx && self.config_edit_is_inline() => {
-                Style::default().fg(Color::Black).bg(Color::Cyan)
-            }
+    fn config_value_style(&self, item: &ConfigItem) -> Style {
+        match (
+            item.level1.as_str(),
+            item.level2.as_str(),
+            item.level3.as_str(),
+            item.current.as_str(),
+        ) {
+            ("GitHub", "Auth", "Connect", "ok") => Style::default().fg(Color::Green),
+            ("GitHub", "Auth", "Connect", "failed") => Style::default().fg(Color::Red),
+            ("GitHub", "Auth", "Connect", "missing") => Style::default().fg(Color::Yellow),
             _ => Style::default().fg(Color::Cyan),
         }
     }
@@ -2700,11 +2870,20 @@ fn build_config_items(config: &Config) -> Vec<ConfigItem> {
         ConfigItem::new(
             "GitHub",
             "Auth",
-            "User",
-            optional_value(config.github_user.as_deref()),
-            "--github-user <user> or GITHUB_USER",
-            "Used when no token is provided. Fetches public owner repositories for the configured user.",
-            ConfigEditKind::Text,
+            "Open token page",
+            "browser",
+            "https://github.com/settings/tokens",
+            "Open GitHub personal access token settings in the browser.",
+            ConfigEditKind::ReadOnly,
+        ),
+        ConfigItem::new(
+            "GitHub",
+            "Auth",
+            "Connect",
+            "not tested",
+            "GitHub connectivity test",
+            "Validate token loading, API reachability, and repository access.",
+            ConfigEditKind::ReadOnly,
         ),
         ConfigItem::new(
             "GitLab",
@@ -2731,15 +2910,6 @@ fn build_config_items(config: &Config) -> Vec<ConfigItem> {
             optional_value(config.dockerhub_username.as_deref()),
             "--dockerhub-user <user> or DOCKERHUB_USERNAME",
             "Required for DockerHub repository search.",
-            ConfigEditKind::Text,
-        ),
-        ConfigItem::new(
-            "GitHub",
-            "API",
-            "Base URL",
-            config.github_api.clone(),
-            "--github-api <url> or GITHUB_API",
-            "Set this for GitHub Enterprise, for example https://github.example.com/api/v3.",
             ConfigEditKind::Text,
         ),
         ConfigItem::new(
@@ -2897,6 +3067,7 @@ mod tests {
         entry_haystacks, open_selected_entry, parse_next_input_key, rank_entries,
         ranked_config_items, resolve_action, start_config_edit, tab_count, Action, AppMode,
         AppModeKind, AppState, ConfigDisplayRow, InputCode, InputKey, RefreshRequest, Tab,
+        UiEvent,
     };
     use crate::config::{Config, RuntimeConfig};
     use crate::models::Entry;
@@ -2907,7 +3078,8 @@ mod tests {
         let config = Config::default();
         let runtime_config = RuntimeConfig::new(&config);
         let shared_config = Arc::new(Mutex::new(config.clone()));
-        AppState::new(entries, config, runtime_config, shared_config)
+        let (tx, _rx) = mpsc::channel::<UiEvent>();
+        AppState::new(entries, config, runtime_config, shared_config, tx)
     }
 
     #[test]
@@ -3260,7 +3432,13 @@ mod tests {
             rows.first(),
             Some(ConfigDisplayRow::Group(group)) if group == "GitHub"
         ));
-        assert!(matches!(rows.get(1), Some(ConfigDisplayRow::Item(_))));
+        assert!(rows.iter().any(|row| matches!(
+            row,
+            ConfigDisplayRow::Subgroup(group) if group == "Auth"
+        )));
+        assert!(rows
+            .iter()
+            .any(|row| matches!(row, ConfigDisplayRow::Item(_))));
     }
 
     #[test]
@@ -3280,14 +3458,87 @@ mod tests {
             .iter()
             .filter_map(|row| match row {
                 ConfigDisplayRow::Item(idx) => Some(app.config_items[*idx].level3.as_str()),
-                ConfigDisplayRow::Group(_) => None,
+                ConfigDisplayRow::Group(_) | ConfigDisplayRow::Subgroup(_) => None,
             })
             .collect();
 
         assert_eq!(
             github_settings,
-            vec!["Enabled", "Interval", "Token", "User", "Base URL"]
+            vec!["Enabled", "Interval", "Token", "Open token page", "Connect"]
         );
+    }
+
+    #[test]
+    fn collapsing_group_hides_its_rows_and_toggles_back() {
+        let mut app = app_state(Vec::new());
+        app.tab = Tab::Config;
+        app.recompute();
+
+        let full = app.config_rows().len();
+        assert!(matches!(
+            app.config_rows().first(),
+            Some(ConfigDisplayRow::Group(g)) if g == "Browser"
+        ));
+        app.selected = 0;
+        assert!(app.toggle_selected_config_collapse());
+
+        let collapsed = app.config_rows();
+        assert!(matches!(
+            collapsed.first(),
+            Some(ConfigDisplayRow::Group(g)) if g == "Browser"
+        ));
+        assert!(collapsed.len() < full);
+        assert!(matches!(
+            collapsed.get(1),
+            Some(ConfigDisplayRow::Group(_))
+        ));
+
+        app.selected = 0;
+        assert!(app.toggle_selected_config_collapse());
+        assert_eq!(app.config_rows().len(), full);
+    }
+
+    #[test]
+    fn collapsing_subgroup_hides_only_its_items() {
+        let mut app = app_state(Vec::new());
+        app.tab = Tab::Config;
+        app.recompute();
+
+        let rows = app.config_rows();
+        let auth_row = rows
+            .iter()
+            .position(|row| matches!(row, ConfigDisplayRow::Subgroup(s) if s == "Auth"))
+            .expect("expected an Auth subgroup");
+        let full = rows.len();
+
+        app.selected = auth_row;
+        assert!(app.toggle_selected_config_collapse());
+
+        let collapsed = app.config_rows();
+        assert!(collapsed.len() < full);
+        assert!(matches!(
+            collapsed.get(auth_row),
+            Some(ConfigDisplayRow::Subgroup(s)) if s == "Auth"
+        ));
+    }
+
+    #[test]
+    fn search_ignores_collapse_state() {
+        let mut app = app_state(Vec::new());
+        app.tab = Tab::Config;
+        app.recompute();
+
+        app.selected = 0;
+        assert!(app.toggle_selected_config_collapse());
+        assert!(app.config_collapsed.contains("Browser"));
+
+        app.query = "browser interval".to_string();
+        let rows = app.config_rows();
+        assert!(rows.iter().any(|row| matches!(
+            row,
+            ConfigDisplayRow::Item(idx) if app.config_items[*idx].level1 == "Browser"
+                && app.config_items[*idx].level3 == "Interval"
+        )));
     }
 
     #[test]
@@ -3296,15 +3547,43 @@ mod tests {
         app.query = "browser sources".to_string();
         app.tab = Tab::Config;
         app.recompute();
-        app.move_config_down();
+        let rows = config_display_rows(&app.config_items, &app.query);
+        app.selected = rows
+            .iter()
+            .position(|row| match row {
+                ConfigDisplayRow::Item(idx) => {
+                    let item = &app.config_items[*idx];
+                    item.level1 == "Browser" && item.level2 == "Source" && item.level3 == "Enabled"
+                }
+                ConfigDisplayRow::Group(_) | ConfigDisplayRow::Subgroup(_) => false,
+            })
+            .unwrap();
 
         start_config_edit(&mut app);
         assert_eq!(
             app.config_items[app.selected_config_item_index().unwrap()].current,
             "disabled"
         );
+    }
 
-        app.query = "github user".to_string();
+    #[test]
+    fn config_tab_char_filters_instead_of_inline_editing() {
+        let mut app = app_state(Vec::new());
+        let (tx, _rx) = mpsc::channel::<RefreshRequest>();
+        app.tab = Tab::Config;
+        app.recompute();
+
+        // 在 Config tab 普通字符应进入搜索查询，而非启动行内编辑
+        apply_action(&mut app, Action::InsertChar('7'), &tx).expect("char should filter");
+        assert!(matches!(app.mode, AppMode::Normal));
+        assert_eq!(app.query, "7");
+    }
+
+    #[test]
+    fn refresh_interval_popup_rejects_non_digits() {
+        let mut app = app_state(Vec::new());
+        app.tab = Tab::Config;
+        app.query = "browser interval".to_string();
         app.recompute();
         let rows = config_display_rows(&app.config_items, &app.query);
         app.selected = rows
@@ -3312,73 +3591,65 @@ mod tests {
             .position(|row| match row {
                 ConfigDisplayRow::Item(idx) => {
                     let item = &app.config_items[*idx];
-                    item.level1 == "GitHub" && item.level2 == "Auth" && item.level3 == "User"
+                    item.level1 == "Browser"
+                        && item.level2 == "Refresh"
+                        && item.level3 == "Interval"
                 }
-                ConfigDisplayRow::Group(_) => false,
+                ConfigDisplayRow::Group(_) | ConfigDisplayRow::Subgroup(_) => false,
             })
             .unwrap();
+
         start_config_edit(&mut app);
-        app.push_config_edit_char('m');
-        app.push_config_edit_char('e');
-        commit_config_edit(&mut app);
-        let item = &app.config_items[app.selected_config_item_index().unwrap()];
-        assert_eq!(item.level1, "GitHub");
-        assert_eq!(item.level2, "Auth");
-        assert_eq!(item.level3, "User");
-        assert_eq!(item.current, "me");
-    }
 
-    #[test]
-    fn refresh_interval_supports_inline_numeric_editing() {
-        let mut app = app_state(Vec::new());
-        let (tx, _rx) = mpsc::channel::<RefreshRequest>();
-        app.tab = Tab::Config;
-        app.query = "browser interval".to_string();
-        app.recompute();
-        app.move_config_down();
-
-        apply_action(&mut app, Action::InsertChar('7'), &tx).expect("inline edit should start");
-
+        // 弹窗打开时 buffer 为空
         match app.mode {
             AppMode::ConfigEdit {
-                ref buffer,
-                item_index,
-                ..
+                ref buffer, cursor, ..
             } => {
-                assert_eq!(buffer, "7");
-                assert!(app.config_edit_is_inline());
-                assert_eq!(app.config_items[item_index].level2, "Refresh");
+                assert!(buffer.is_empty());
+                assert_eq!(cursor, 0);
             }
-            _ => panic!("expected inline config edit"),
+            _ => panic!("expected popup config edit"),
         }
 
-        app.push_config_edit_char('5');
-        commit_config_edit(&mut app);
-
-        let item = &app.config_items[app.selected_config_item_index().unwrap()];
-        assert_eq!(item.current, "75s");
+        app.push_config_edit_char('a'); // 非数字被拒绝
+        app.push_config_edit_char('9');
+        match app.mode {
+            AppMode::ConfigEdit { ref buffer, .. } => assert_eq!(buffer, "9"),
+            _ => panic!("expected popup config edit"),
+        }
     }
 
     #[test]
-    fn enter_editing_refresh_interval_replaces_existing_digits() {
+    fn editing_refresh_interval_opens_empty_and_saves_new_value() {
         let mut app = app_state(Vec::new());
         app.tab = Tab::Config;
         app.query = "browser interval".to_string();
         app.recompute();
-        app.move_config_down();
+        let rows = config_display_rows(&app.config_items, &app.query);
+        app.selected = rows
+            .iter()
+            .position(|row| match row {
+                ConfigDisplayRow::Item(idx) => {
+                    let item = &app.config_items[*idx];
+                    item.level1 == "Browser"
+                        && item.level2 == "Refresh"
+                        && item.level3 == "Interval"
+                }
+                ConfigDisplayRow::Group(_) | ConfigDisplayRow::Subgroup(_) => false,
+            })
+            .unwrap();
 
         start_config_edit(&mut app);
 
         match app.mode {
             AppMode::ConfigEdit {
-                ref buffer,
-                select_all,
-                ..
+                ref buffer, cursor, ..
             } => {
-                assert_eq!(buffer, "5");
-                assert!(select_all);
+                assert!(buffer.is_empty());
+                assert_eq!(cursor, 0);
             }
-            _ => panic!("expected inline config edit"),
+            _ => panic!("expected popup config edit"),
         }
 
         app.push_config_edit_char('4');
@@ -3387,6 +3658,90 @@ mod tests {
 
         let item = &app.config_items[app.selected_config_item_index().unwrap()];
         assert_eq!(item.current, "43s");
+    }
+
+    #[test]
+    fn github_token_popup_opens_empty_and_saves_masked() {
+        let mut app = app_state(Vec::new());
+        app.config.github_token = Some("oldtoken".to_string());
+        app.sync_config_items();
+        app.tab = Tab::Config;
+        app.query = "github token".to_string();
+        app.recompute();
+        let rows = config_display_rows(&app.config_items, &app.query);
+        app.selected = rows
+            .iter()
+            .position(|row| match row {
+                ConfigDisplayRow::Item(idx) => {
+                    let item = &app.config_items[*idx];
+                    item.level1 == "GitHub" && item.level2 == "Auth" && item.level3 == "Token"
+                }
+                ConfigDisplayRow::Group(_) | ConfigDisplayRow::Subgroup(_) => false,
+            })
+            .unwrap();
+
+        start_config_edit(&mut app);
+
+        match app.mode {
+            AppMode::ConfigEdit {
+                ref buffer, cursor, ..
+            } => {
+                assert!(buffer.is_empty());
+                assert_eq!(cursor, 0);
+            }
+            _ => panic!("expected popup secret edit"),
+        }
+
+        app.push_config_edit_char('n');
+        app.push_config_edit_char('e');
+        app.push_config_edit_char('w');
+        commit_config_edit(&mut app);
+
+        assert_eq!(app.config.github_token.as_deref(), Some("new"));
+        let item = &app.config_items[app.selected_config_item_index().unwrap()];
+        assert_eq!(item.current, "present");
+    }
+
+    #[test]
+    fn config_edit_cursor_moves_and_inserts_in_middle() {
+        let mut app = app_state(Vec::new());
+        app.mode = AppMode::ConfigEdit {
+            item_index: 0,
+            buffer: "abc".to_string(),
+            cursor: 3,
+        };
+        app.config_edit_cursor_left();
+        app.config_edit_cursor_left();
+        app.push_config_edit_char('X'); // 在 a 与 b 之间插入
+        match app.mode {
+            AppMode::ConfigEdit {
+                ref buffer, cursor, ..
+            } => {
+                assert_eq!(buffer, "aXbc");
+                assert_eq!(cursor, 2);
+            }
+            _ => panic!("expected popup config edit"),
+        }
+
+        app.config_edit_cursor_home();
+        app.pop_config_edit_char(); // home 处退格无效果
+        app.config_edit_cursor_end();
+        app.pop_config_edit_char(); // 删除末尾 c
+        match app.mode {
+            AppMode::ConfigEdit { ref buffer, .. } => assert_eq!(buffer, "aXb"),
+            _ => panic!("expected popup config edit"),
+        }
+
+        app.config_edit_clear();
+        match app.mode {
+            AppMode::ConfigEdit {
+                ref buffer, cursor, ..
+            } => {
+                assert!(buffer.is_empty());
+                assert_eq!(cursor, 0);
+            }
+            _ => panic!("expected popup config edit"),
+        }
     }
 
     #[test]
@@ -3410,7 +3765,17 @@ mod tests {
         app.tab = Tab::GitHub;
         app.query = "github enabled".to_string();
         app.recompute();
-        app.move_config_down();
+        let rows = config_display_rows(&app.config_items, &app.query);
+        app.selected = rows
+            .iter()
+            .position(|row| match row {
+                ConfigDisplayRow::Item(idx) => {
+                    let item = &app.config_items[*idx];
+                    item.level1 == "GitHub" && item.level2 == "Source" && item.level3 == "Enabled"
+                }
+                ConfigDisplayRow::Group(_) | ConfigDisplayRow::Subgroup(_) => false,
+            })
+            .unwrap();
 
         start_config_edit(&mut app);
 

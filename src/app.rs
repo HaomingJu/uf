@@ -127,12 +127,12 @@ pub fn run() -> Result<(), String> {
         refresh_rx,
     );
 
-    drop(tx);
     run_ui(
         entries,
         config,
         runtime_config,
         shared_config,
+        tx,
         rx,
         refresh_tx,
     )

@@ -361,6 +361,45 @@ pub fn fetch_github_page(
     fetch_github_rows(&url, token)
 }
 
+pub fn test_github_connectivity(config: &Config) -> Result<String, String> {
+    let Some(token) = config.github_token.as_deref() else {
+        return Err("GitHub token is missing.".to_string());
+    };
+
+    let user_url = format!("{}/user", config.github_api.trim_end_matches('/'));
+    let user_body = github_api_get(&user_url, token)?;
+    let user_json: JsonValue =
+        serde_json::from_str(&user_body).map_err(|err| format!("parse GitHub user JSON: {err}"))?;
+    if let Some(message) = clean_json_str(user_json.get("message")) {
+        if !message.is_empty() {
+            return Err(format!("GitHub user check failed: {message}"));
+        }
+    }
+    let login = clean_json_str(user_json.get("login"))
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| "GitHub user check failed: login not found.".to_string())?;
+
+    let repos_url = format!(
+        "{}/user/repos?per_page=1&page=1&sort=updated&affiliation=owner,collaborator,organization_member",
+        config.github_api.trim_end_matches('/')
+    );
+    let repos_body = github_api_get(&repos_url, token)?;
+    let repos_json: JsonValue = serde_json::from_str(&repos_body)
+        .map_err(|err| format!("parse GitHub repos JSON: {err}"))?;
+    match repos_json {
+        JsonValue::Array(_) => Ok(format!("Connected as {login}. Repository access OK.")),
+        JsonValue::Object(ref obj) => {
+            let message = clean_json_str(obj.get("message")).unwrap_or_default();
+            if message.is_empty() {
+                Err("GitHub repository check failed.".to_string())
+            } else {
+                Err(format!("GitHub repository check failed: {message}"))
+            }
+        }
+        _ => Err("GitHub repository check returned an unexpected response.".to_string()),
+    }
+}
+
 pub fn fetch_gitlab_page(config: &Config, page: usize) -> Result<Vec<Entry>, String> {
     let mut url = format!(
         "{}/projects?simple=true&per_page=100&page={}&order_by=last_activity_at&sort=desc",
@@ -625,6 +664,20 @@ fn fetch_github_rows(url: &str, token: Option<&str>) -> Result<Vec<Entry>, Strin
 
     let output = command_output("curl", &with_url(args, url))?;
     parse_github_entries(&output)
+}
+
+fn github_api_get(url: &str, token: &str) -> Result<String, String> {
+    let auth_header = format!("Authorization: Bearer {token}");
+    let args = vec![
+        "-sSL",
+        "-H",
+        "Accept: application/vnd.github+json",
+        "-H",
+        "User-Agent: uf",
+        "-H",
+        auth_header.as_str(),
+    ];
+    command_output_with_stderr("curl", &with_url(args, url))
 }
 
 fn fetch_gitlab_rows(url: &str, token: Option<&str>) -> Result<Vec<Entry>, String> {
