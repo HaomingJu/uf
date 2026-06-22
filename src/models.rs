@@ -14,9 +14,14 @@ impl Entry {
         detail: impl Into<String>,
     ) -> Self {
         let title = title.into();
+        let url = url.into();
+        let mut title = normalize_title(&title);
+        if title.is_empty() {
+            title = url.clone();
+        }
         Self {
-            title: normalize_title(&title),
-            url: url.into(),
+            title,
+            url,
             source: source.into(),
             detail: detail.into(),
         }
@@ -72,5 +77,17 @@ mod tests {
         );
 
         assert_eq!(entry.title, "目开发代码合入记录 - 飞书云文档");
+    }
+
+    #[test]
+    fn entry_new_falls_back_to_url_when_title_is_empty() {
+        let entry = Entry::new("", "https://www.italent.cn/portal", "history", "");
+        assert_eq!(entry.title, "https://www.italent.cn/portal");
+    }
+
+    #[test]
+    fn entry_new_falls_back_to_url_when_title_is_only_format_chars() {
+        let entry = Entry::new("\u{200f}\u{200d}  ", "https://example.com/x", "history", "");
+        assert_eq!(entry.title, "https://example.com/x");
     }
 }

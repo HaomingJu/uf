@@ -44,6 +44,28 @@ pub enum RefreshRequest {
     DockerHub,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum HistorySort {
+    Time,
+    Alphabetical,
+}
+
+impl HistorySort {
+    fn toggled(self) -> Self {
+        match self {
+            HistorySort::Time => HistorySort::Alphabetical,
+            HistorySort::Alphabetical => HistorySort::Time,
+        }
+    }
+
+    fn label(self) -> &'static str {
+        match self {
+            HistorySort::Time => "recent",
+            HistorySort::Alphabetical => "A-Z",
+        }
+    }
+}
+
 pub fn run_ui(
     entries: Vec<Entry>,
     config: Config,
@@ -358,6 +380,7 @@ enum Action {
     ConfigEditCursorHome,
     ConfigEditCursorEnd,
     ConfigEditClear,
+    ToggleHistorySort,
 }
 
 fn resolve_action(mode: AppModeKind, key: InputKey) -> Option<Action> {
@@ -378,6 +401,7 @@ fn resolve_normal_action(key: InputKey) -> Option<Action> {
         InputCode::Char('u') if key.ctrl => Some(Action::PageUp),
         InputCode::Char('d') if key.ctrl => Some(Action::PageDown),
         InputCode::Char('r') if key.ctrl => Some(Action::RefreshCurrentTab),
+        InputCode::Char('s') if key.ctrl => Some(Action::ToggleHistorySort),
         InputCode::Char('b') if key.ctrl => Some(Action::ToggleConfigTab),
         InputCode::Char('j') | InputCode::Char('n') if key.ctrl => Some(Action::MoveDown),
         InputCode::Char('k') | InputCode::Char('p') if key.ctrl => Some(Action::MoveUp),
@@ -495,6 +519,7 @@ fn apply_action(
             app.next_tab();
         }
         Action::ToggleConfigTab => app.toggle_config_tab(),
+        Action::ToggleHistorySort => app.toggle_history_sort(),
         Action::RefreshCurrentTab => {
             if let Some(request) = app.tab.refresh_request() {
                 let _ = refresh_requests.send(request);
@@ -1157,7 +1182,7 @@ fn render(frame: &mut Frame<'_>, app: &mut AppState) {
 fn render_header(frame: &mut Frame<'_>, area: Rect, app: &AppState) {
     let header = Layout::vertical([Constraint::Length(1), Constraint::Length(1)]).split(area);
 
-    let title = Line::from(vec![
+    let mut title_spans = vec![
         Span::styled(
             " uf ",
             Style::default()
@@ -1169,7 +1194,15 @@ fn render_header(frame: &mut Frame<'_>, area: Rect, app: &AppState) {
             format!("{} results", app.visible.len()),
             Style::default().fg(Color::Gray),
         ),
-    ]);
+    ];
+    if app.tab == Tab::History {
+        title_spans.push(Span::raw("  "));
+        title_spans.push(Span::styled(
+            format!("sort: {} (Ctrl+S)", app.history_sort.label()),
+            Style::default().fg(Color::DarkGray),
+        ));
+    }
+    let title = Line::from(title_spans);
 
     frame.render_widget(
         Paragraph::new(title).style(Style::default()).block(
@@ -1951,6 +1984,7 @@ fn rank_entries(
     haystacks: &[String],
     query: &str,
     tab: Tab,
+    sort: HistorySort,
 ) -> Vec<(i64, usize)> {
     let mut matcher = FuzzyMatcher::new(query);
     let mut ranked: Vec<(i64, usize)> = entries
@@ -1968,6 +2002,16 @@ fn rank_entries(
             })
         })
         .collect();
+
+    // History 标签页的字母排序：忽略模糊分数，直接按标题升序
+    if tab == Tab::History && sort == HistorySort::Alphabetical {
+        ranked.sort_by(|a, b| {
+            let title_a = entries[a.1].title.to_lowercase();
+            let title_b = entries[b.1].title.to_lowercase();
+            title_a.cmp(&title_b).then_with(|| a.1.cmp(&b.1))
+        });
+        return ranked;
+    }
 
     ranked.sort_by(|a, b| match b.0.cmp(&a.0) {
         Ordering::Equal => a.1.cmp(&b.1),
@@ -2214,6 +2258,7 @@ struct AppState {
     mode: AppMode,
     dirty: bool,
     config_collapsed: HashSet<String>,
+    history_sort: HistorySort,
 }
 
 struct ConfigItem {
@@ -2340,6 +2385,7 @@ impl AppState {
             mode: AppMode::Normal,
             dirty: false,
             config_collapsed: HashSet::new(),
+            history_sort: HistorySort::Time,
         };
         app.recompute();
         app
@@ -2362,11 +2408,17 @@ impl AppState {
             self.scroll_start = 0;
             return;
         }
-        self.visible = rank_entries(&self.entries, &self.haystacks, &self.query, self.tab)
-            .into_iter()
-            .map(|(_, idx)| idx)
-            .take(300)
-            .collect();
+        self.visible = rank_entries(
+            &self.entries,
+            &self.haystacks,
+            &self.query,
+            self.tab,
+            self.history_sort,
+        )
+        .into_iter()
+        .map(|(_, idx)| idx)
+        .take(300)
+        .collect();
         self.selected = self.selected.min(self.visible.len().saturating_sub(1));
         self.clamp_scroll_start();
         self.ensure_selected_visible();
@@ -2719,6 +2771,18 @@ impl AppState {
         self.recompute();
     }
 
+    fn toggle_history_sort(&mut self) {
+        if self.tab != Tab::History {
+            self.message = "Sorting toggle applies to the History tab.".to_string();
+            return;
+        }
+        self.history_sort = self.history_sort.toggled();
+        self.message = format!("History sorted by {}.", self.history_sort.label());
+        self.selected = 0;
+        self.scroll_start = 0;
+        self.recompute();
+    }
+
     fn toggle_config_tab(&mut self) {
         self.config_tab_visible = !self.config_tab_visible;
         self.mode = AppMode::Normal;
@@ -3066,8 +3130,8 @@ mod tests {
         apply_action, best_entry, commit_config_edit, config_display_rows, display_width,
         entry_haystacks, open_selected_entry, parse_next_input_key, rank_entries,
         ranked_config_items, resolve_action, start_config_edit, tab_count, Action, AppMode,
-        AppModeKind, AppState, ConfigDisplayRow, InputCode, InputKey, RefreshRequest, Tab,
-        UiEvent,
+        AppModeKind, AppState, ConfigDisplayRow, HistorySort, InputCode, InputKey, RefreshRequest,
+        Tab, UiEvent,
     };
     use crate::config::{Config, RuntimeConfig};
     use crate::models::Entry;
@@ -3099,9 +3163,78 @@ mod tests {
             Entry::new("Repo", "https://github.com/me/repo", "github", ""),
         ];
         let haystacks = entry_haystacks(&entries);
-        let ranked = rank_entries(&entries, &haystacks, "", Tab::History);
+        let ranked = rank_entries(&entries, &haystacks, "", Tab::History, HistorySort::Time);
         assert_eq!(ranked.len(), 1);
         assert_eq!(ranked[0].1, 0);
+    }
+
+    #[test]
+    fn history_alphabetical_sort_orders_by_title() {
+        let entries = vec![
+            Entry::new("Zebra", "https://z.com", "history", ""),
+            Entry::new("Apple", "https://a.com", "history", ""),
+            Entry::new("Mango", "https://m.com", "history", ""),
+        ];
+        let haystacks = entry_haystacks(&entries);
+
+        // 时间模式：保持加载顺序（idx 升序）
+        let by_time = rank_entries(&entries, &haystacks, "", Tab::History, HistorySort::Time);
+        assert_eq!(
+            by_time.iter().map(|(_, i)| *i).collect::<Vec<_>>(),
+            vec![0, 1, 2]
+        );
+
+        // 字母模式：按标题升序 Apple < Mango < Zebra
+        let by_alpha = rank_entries(
+            &entries,
+            &haystacks,
+            "",
+            Tab::History,
+            HistorySort::Alphabetical,
+        );
+        let titles: Vec<&str> = by_alpha
+            .iter()
+            .map(|(_, i)| entries[*i].title.as_str())
+            .collect();
+        assert_eq!(titles, vec!["Apple", "Mango", "Zebra"]);
+    }
+
+    #[test]
+    fn alphabetical_sort_does_not_affect_other_tabs() {
+        let entries = vec![
+            Entry::new("Zebra", "https://github.com/z", "github", ""),
+            Entry::new("Apple", "https://github.com/a", "github", ""),
+        ];
+        let haystacks = entry_haystacks(&entries);
+        // GitHub tab 即使传 Alphabetical 也保持原排序（分数+idx）
+        let ranked = rank_entries(
+            &entries,
+            &haystacks,
+            "",
+            Tab::GitHub,
+            HistorySort::Alphabetical,
+        );
+        assert_eq!(
+            ranked.iter().map(|(_, i)| *i).collect::<Vec<_>>(),
+            vec![0, 1]
+        );
+    }
+
+    #[test]
+    fn toggle_history_sort_cycles_and_is_history_only() {
+        let mut app = app_state(Vec::new());
+        assert_eq!(app.tab, Tab::History);
+        assert_eq!(app.history_sort, HistorySort::Time);
+
+        app.toggle_history_sort();
+        assert_eq!(app.history_sort, HistorySort::Alphabetical);
+        app.toggle_history_sort();
+        assert_eq!(app.history_sort, HistorySort::Time);
+
+        // 非 History tab 时不切换
+        app.tab = Tab::GitHub;
+        app.toggle_history_sort();
+        assert_eq!(app.history_sort, HistorySort::Time);
     }
 
     #[test]
