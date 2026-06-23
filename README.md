@@ -169,6 +169,8 @@ Use `--debug` to write diagnostic logs to stderr. Redirect stderr to a file so t
 uf --debug 2>debug.log
 ```
 
+If `stderr` is still attached to the terminal, tab/source diagnostics are suppressed while the full-screen UI is running so the TUI does not get corrupted. This applies both to `--debug` output and to source-level diagnostics such as browser access warnings.
+
 Open the app as usual, then quit. Inspect the log:
 
 ```bash

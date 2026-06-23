@@ -1,4 +1,5 @@
 use crate::config::Config;
+use crate::log;
 use crate::models::Entry;
 use plist::Value as PlistValue;
 use serde_json::Value as JsonValue;
@@ -519,7 +520,7 @@ fn load_safari() -> Result<Vec<Entry>, String> {
 fn source_log(message: String) {
     SUPPRESS_SOURCE_LOGS.with(|flag| {
         if !flag.get() {
-            eprintln!("{message}");
+            log::write(&message);
         }
     });
 }
@@ -1097,9 +1098,7 @@ fn copy_sqlite_to_temp(db_path: &Path) -> Result<PathBuf, String> {
 
 pub fn fetch_dockerhub_page(config: &Config, page: usize) -> Result<Vec<Entry>, String> {
     let Some(username) = &config.dockerhub_username else {
-        if config.debug {
-            eprintln!("[dockerhub] skipped: DOCKERHUB_USERNAME not set");
-        }
+        log::write_debug(config, "[dockerhub] skipped: DOCKERHUB_USERNAME not set");
         return Ok(Vec::new());
     };
 
@@ -1108,17 +1107,18 @@ pub fn fetch_dockerhub_page(config: &Config, page: usize) -> Result<Vec<Entry>, 
         username, page
     );
 
-    if config.debug {
-        eprintln!("[dockerhub] GET {url}");
-        eprintln!(
+    log::write_debug(config, &format!("[dockerhub] GET {url}"));
+    log::write_debug(
+        config,
+        &format!(
             "[dockerhub] token: {}",
             if config.dockerhub_token.is_some() {
                 "present"
             } else {
                 "none (public repos only)"
             }
-        );
-    }
+        ),
+    );
 
     let mut args = vec!["-sSL", "-H", "Content-Type: application/json"];
     let auth_header;
@@ -1130,30 +1130,35 @@ pub fn fetch_dockerhub_page(config: &Config, page: usize) -> Result<Vec<Entry>, 
 
     let output = command_output_with_stderr("curl", &with_url(args, &url))?;
 
-    if config.debug {
-        eprintln!("[dockerhub] curl response ({} bytes):", output.len());
+    if log::debug_enabled(config) {
+        log::write_debug(
+            config,
+            &format!("[dockerhub] curl response ({} bytes):", output.len()),
+        );
         let preview = if output.len() > 500 {
             format!("{}... (truncated)", &output[..500])
         } else {
             output.clone()
         };
-        eprintln!("{preview}");
+        log::write_debug(config, &preview);
     }
 
     if output.is_empty() {
-        if config.debug {
-            eprintln!(
-                "[dockerhub] curl returned empty body (possible auth error or network issue)"
-            );
-        }
+        log::write_debug(
+            config,
+            "[dockerhub] curl returned empty body (possible auth error or network issue)",
+        );
         return Ok(Vec::new());
     }
 
-    let entries_without_tags = parse_dockerhub_repo_entries(&output, config.debug)?;
-    if config.debug {
-        eprintln!(
-            "[dockerhub] parsed {} repository entries",
-            entries_without_tags.len()
+    let entries_without_tags = parse_dockerhub_repo_entries(&output, log::debug_enabled(config))?;
+    if log::debug_enabled(config) {
+        log::write_debug(
+            config,
+            &format!(
+                "[dockerhub] parsed {} repository entries",
+                entries_without_tags.len()
+            ),
         );
     }
 
@@ -1162,9 +1167,10 @@ pub fn fetch_dockerhub_page(config: &Config, page: usize) -> Result<Vec<Entry>, 
         .map(|entry| with_dockerhub_tags(entry, config.dockerhub_token.as_deref()))
         .collect();
 
-    if config.debug {
-        eprintln!("[dockerhub] page {page}: {} entries", entries.len());
-    }
+    log::write_debug(
+        config,
+        &format!("[dockerhub] page {page}: {} entries", entries.len()),
+    );
 
     Ok(entries)
 }
@@ -1178,7 +1184,7 @@ fn parse_dockerhub_repo_entries(text: &str, debug: bool) -> Result<Vec<Entry>, S
             .or_else(|| clean_json_str(data.get("detail")))
             .unwrap_or_default();
         if !message.is_empty() {
-            eprintln!("[dockerhub] API_ERROR: {message}");
+            log::write(&format!("[dockerhub] API_ERROR: {message}"));
         }
     }
 

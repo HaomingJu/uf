@@ -1,4 +1,5 @@
 use crate::config::{parse_refresh_interval, Config, RuntimeConfig};
+use crate::log;
 use crate::matchers::FuzzyMatcher;
 use crate::models::Entry;
 use crate::sources::{
@@ -1332,7 +1333,7 @@ fn render_results(frame: &mut Frame<'_>, area: Rect, app: &mut AppState) {
     let inner_width = area.width.saturating_sub(2 + 2) as usize;
     let type_width = 14usize;
     let sep = 4usize; // spaces between columns
-    // GitHub/GitLab 行尾显示 star 数（如 13🌟），预留固定列宽
+                      // GitHub/GitLab 行尾显示 star 数（如 13🌟），预留固定列宽
     let is_repo_tab = app.tab == Tab::GitHub || app.tab == Tab::GitLab;
     let star_width = if is_repo_tab { 10usize } else { 0usize };
     let repo_no_description = app.tab == Tab::GitHub
@@ -1384,8 +1385,12 @@ fn render_results(frame: &mut Frame<'_>, area: Rect, app: &mut AppState) {
                 };
                 let star_col = if star_width > 0 {
                     match repo_entry_stars(entry) {
-                        Some(stars) if stars >= 10_000 => format!("{:>5} 🌟", format!("{:.1}W", stars as f64 / 10_000.0)),
-                        Some(stars) if stars >= 1_000 => format!("{:>5} 🌟", format!("{:.1}K", stars as f64 / 1_000.0)),
+                        Some(stars) if stars >= 10_000 => {
+                            format!("{:>5} 🌟", format!("{:.1}W", stars as f64 / 10_000.0))
+                        }
+                        Some(stars) if stars >= 1_000 => {
+                            format!("{:>5} 🌟", format!("{:.1}K", stars as f64 / 1_000.0))
+                        }
                         Some(stars) if stars > 0 => format!("{:>5} 🌟", stars),
                         _ => String::new(),
                     }
@@ -1682,9 +1687,7 @@ fn render_config(frame: &mut Frame<'_>, area: Rect, app: &AppState) {
                 });
                 match idx {
                     ConfigDisplayRow::Group(group) => {
-                        let collapsed = app
-                            .config_collapsed
-                            .contains(&config_group_key(&group))
+                        let collapsed = app.config_collapsed.contains(&config_group_key(&group))
                             && app.query.is_empty();
                         let arrow = if collapsed { "▶" } else { "▼" };
                         ListItem::new(Line::from(vec![Span::styled(
@@ -2414,7 +2417,7 @@ impl AppState {
             selected: 0,
             scroll_start: 0,
             result_viewport_height: 0,
-            message: "Type to search.".to_string(),
+            message: initial_status_message(&config),
             tab: Tab::History,
             config_tab_visible: true,
             cursor_visible: true,
@@ -2502,7 +2505,9 @@ impl AppState {
             self.config_collapsed.insert(key.clone());
             self.message = format!("Collapsed {key}.");
         }
-        self.selected = self.selected.min(self.config_result_count().saturating_sub(1));
+        self.selected = self
+            .selected
+            .min(self.config_result_count().saturating_sub(1));
         true
     }
 
@@ -2918,6 +2923,12 @@ impl AppState {
             _ => Style::default().fg(Color::Cyan),
         }
     }
+}
+
+fn initial_status_message(config: &Config) -> String {
+    log::suppressed_debug_notice(config)
+        .unwrap_or("Type to search.")
+        .to_string()
 }
 
 fn build_config_items(config: &Config) -> Vec<ConfigItem> {
@@ -3657,10 +3668,7 @@ mod tests {
             Some(ConfigDisplayRow::Group(g)) if g == "Browser"
         ));
         assert!(collapsed.len() < full);
-        assert!(matches!(
-            collapsed.get(1),
-            Some(ConfigDisplayRow::Group(_))
-        ));
+        assert!(matches!(collapsed.get(1), Some(ConfigDisplayRow::Group(_))));
 
         app.selected = 0;
         assert!(app.toggle_selected_config_collapse());

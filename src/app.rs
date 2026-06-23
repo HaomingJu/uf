@@ -1,4 +1,5 @@
 use crate::config::{Config, RuntimeConfig};
+use crate::log;
 use crate::sources::{
     browser_source_signature, fetch_dockerhub_page, fetch_github_page, fetch_gitlab_page,
     load_cached_remote_with_refresh_check, load_local_browser_entries, save_remote_cache,
@@ -33,7 +34,7 @@ pub fn run() -> Result<(), String> {
             match load_local_browser_entries() {
                 Ok(rows) => rows,
                 Err(err) => {
-                    eprintln!("browser sources: {err}");
+                    log::write(&format!("browser sources: {err}"));
                     Vec::new()
                 }
             }
