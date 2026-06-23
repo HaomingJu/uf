@@ -17,6 +17,7 @@ thread_local! {
 }
 
 const DOCKERHUB_TAGS_MARKER: &str = "\nWEB_FZF_TAGS\t";
+const REPO_STARS_MARKER: &str = "\nWEB_FZF_STARS\t";
 
 struct CachedEntries {
     saved_at: u64,
@@ -402,7 +403,7 @@ pub fn test_github_connectivity(config: &Config) -> Result<String, String> {
 
 pub fn fetch_gitlab_page(config: &Config, page: usize) -> Result<Vec<Entry>, String> {
     let mut url = format!(
-        "{}/projects?simple=true&per_page=100&page={}&order_by=last_activity_at&sort=desc",
+        "{}/projects?per_page=100&page={}&order_by=last_activity_at&sort=desc",
         config.gitlab_api.trim_end_matches('/'),
         page
     );
@@ -802,7 +803,12 @@ fn parse_github_entries(text: &str) -> Result<Vec<Entry>, String> {
             let title = clean_json_str(item.get("full_name"))
                 .or_else(|| clean_json_str(item.get("name")))
                 .unwrap_or_else(|| url.clone());
-            let detail = clean_json_str(item.get("description")).unwrap_or_default();
+            let description = clean_json_str(item.get("description")).unwrap_or_default();
+            let stars = item
+                .get("stargazers_count")
+                .and_then(JsonValue::as_u64)
+                .unwrap_or(0);
+            let detail = repo_detail_with_stars(&description, stars);
             Some(Entry::new(title, url, "github", detail))
         })
         .collect())
@@ -825,7 +831,12 @@ fn parse_gitlab_entries(text: &str) -> Result<Vec<Entry>, String> {
             let title = clean_json_str(item.get("path_with_namespace"))
                 .or_else(|| clean_json_str(item.get("name")))
                 .unwrap_or_else(|| url.clone());
-            let detail = clean_json_str(item.get("description")).unwrap_or_default();
+            let description = clean_json_str(item.get("description")).unwrap_or_default();
+            let stars = item
+                .get("star_count")
+                .and_then(JsonValue::as_u64)
+                .unwrap_or(0);
+            let detail = repo_detail_with_stars(&description, stars);
             Some(Entry::new(title, url, "gitlab", detail))
         })
         .collect())
@@ -833,6 +844,31 @@ fn parse_gitlab_entries(text: &str) -> Result<Vec<Entry>, String> {
 
 fn clean_json_str(value: Option<&JsonValue>) -> Option<String> {
     json_str(value).map(clean_text)
+}
+
+// GitHub/GitLab 仓库的 star 数以 marker 形式拼在 detail 末尾，
+// 仿 dockerhub tags 的存储方式，避免给 Entry 新增字段。
+fn repo_detail_with_stars(description: &str, stars: u64) -> String {
+    if stars == 0 {
+        description.to_string()
+    } else {
+        format!("{description}{REPO_STARS_MARKER}{stars}")
+    }
+}
+
+pub fn repo_entry_description(entry: &Entry) -> &str {
+    entry
+        .detail
+        .split_once(REPO_STARS_MARKER)
+        .map(|(description, _)| description)
+        .unwrap_or(&entry.detail)
+}
+
+pub fn repo_entry_stars(entry: &Entry) -> Option<u64> {
+    entry
+        .detail
+        .split_once(REPO_STARS_MARKER)
+        .and_then(|(_, stars)| stars.trim().parse::<u64>().ok())
 }
 
 fn json_str(value: Option<&JsonValue>) -> Option<&str> {
@@ -1178,7 +1214,8 @@ fn parse_dockerhub_repo_entries(text: &str, debug: bool) -> Result<Vec<Entry>, S
 mod tests {
     use super::{
         clean_title, deduplicate, dockerhub_detail_with_tags, dockerhub_entry_description,
-        dockerhub_entry_tags, is_macos_permission_denied_message, parse_tsv_entries,
+        dockerhub_entry_tags, is_macos_permission_denied_message, parse_github_entries,
+        parse_gitlab_entries, parse_tsv_entries, repo_entry_description, repo_entry_stars,
     };
     use crate::models::Entry;
 
@@ -1231,5 +1268,39 @@ mod tests {
 
         assert_eq!(dockerhub_entry_description(&entry), "Small base image");
         assert_eq!(dockerhub_entry_tags(&entry), vec!["latest", "1.0"]);
+    }
+
+    #[test]
+    fn github_entries_carry_star_count() {
+        let json = r#"[
+            {"html_url":"https://github.com/me/repo","full_name":"me/repo","description":"demo","stargazers_count":13},
+            {"html_url":"https://github.com/me/zero","full_name":"me/zero","description":"none","stargazers_count":0}
+        ]"#;
+        let rows = parse_github_entries(json).unwrap();
+        assert_eq!(rows.len(), 2);
+        // description 与 star 分别可读出
+        assert_eq!(repo_entry_description(&rows[0]), "demo");
+        assert_eq!(repo_entry_stars(&rows[0]), Some(13));
+        // 0 星不写入 marker
+        assert_eq!(repo_entry_description(&rows[1]), "none");
+        assert_eq!(repo_entry_stars(&rows[1]), None);
+    }
+
+    #[test]
+    fn gitlab_entries_carry_star_count() {
+        let json = r#"[
+            {"web_url":"https://gitlab.com/g/p","path_with_namespace":"g/p","description":"d","star_count":7}
+        ]"#;
+        let rows = parse_gitlab_entries(json).unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(repo_entry_description(&rows[0]), "d");
+        assert_eq!(repo_entry_stars(&rows[0]), Some(7));
+    }
+
+    #[test]
+    fn repo_stars_absent_when_no_marker() {
+        let entry = Entry::new("t", "https://x", "github", "plain description");
+        assert_eq!(repo_entry_description(&entry), "plain description");
+        assert_eq!(repo_entry_stars(&entry), None);
     }
 }

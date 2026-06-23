@@ -1,7 +1,10 @@
 use crate::config::{parse_refresh_interval, Config, RuntimeConfig};
 use crate::matchers::FuzzyMatcher;
 use crate::models::Entry;
-use crate::sources::{dockerhub_entry_description, dockerhub_entry_tags, test_github_connectivity};
+use crate::sources::{
+    dockerhub_entry_description, dockerhub_entry_tags, repo_entry_description, repo_entry_stars,
+    test_github_connectivity,
+};
 use crossterm::cursor::{Hide, Show};
 use crossterm::execute;
 use crossterm::terminal::{EnterAlternateScreen, LeaveAlternateScreen};
@@ -1328,16 +1331,20 @@ fn render_results(frame: &mut Frame<'_>, area: Rect, app: &mut AppState) {
     // inner width minus highlight symbol "❯ " (2 chars)
     let inner_width = area.width.saturating_sub(2 + 2) as usize;
     let type_width = 14usize;
-    let sep = 2usize; // spaces between columns
+    let sep = 4usize; // spaces between columns
+    // GitHub/GitLab 行尾显示 star 数（如 13🌟），预留固定列宽
+    let is_repo_tab = app.tab == Tab::GitHub || app.tab == Tab::GitLab;
+    let star_width = if is_repo_tab { 10usize } else { 0usize };
     let repo_no_description = app.tab == Tab::GitHub
         || app.tab == Tab::GitLab
         || app.tab == Tab::DockerHub
         || app.tab == Tab::History;
     let (name_width, desc_width) = if repo_no_description {
-        (
-            inner_width.saturating_sub(type_width).saturating_sub(sep),
-            0,
-        )
+        let mut name_width = inner_width.saturating_sub(type_width).saturating_sub(sep);
+        if star_width > 0 {
+            name_width = name_width.saturating_sub(star_width).saturating_sub(sep);
+        }
+        (name_width, 0)
     } else {
         let name_width = (inner_width / 2).min(40).max(10);
         let desc_width = inner_width
@@ -1365,11 +1372,25 @@ fn render_results(frame: &mut Frame<'_>, area: Rect, app: &mut AppState) {
             .map(|(row, idx)| {
                 let entry = &app.entries[idx];
                 let name_col = pad_or_truncate(&entry.title, name_width);
-                let type_col = pad_or_truncate(&entry.source, type_width);
+                let type_col = if is_repo_tab {
+                    truncate_to_width(&entry.source, type_width)
+                } else {
+                    pad_or_truncate(&entry.source, type_width)
+                };
                 let desc_col = if desc_width == 0 {
                     String::new()
                 } else {
                     truncate_to_width(entry_detail(entry), desc_width)
+                };
+                let star_col = if star_width > 0 {
+                    match repo_entry_stars(entry) {
+                        Some(stars) if stars >= 10_000 => format!("{:>5} 🌟", format!("{:.1}W", stars as f64 / 10_000.0)),
+                        Some(stars) if stars >= 1_000 => format!("{:>5} 🌟", format!("{:.1}K", stars as f64 / 1_000.0)),
+                        Some(stars) if stars > 0 => format!("{:>5} 🌟", stars),
+                        _ => String::new(),
+                    }
+                } else {
+                    String::new()
                 };
                 let row_style = Style::default().bg(if row % 2 == 0 {
                     ROW_EVEN_BG
@@ -1383,8 +1404,21 @@ fn render_results(frame: &mut Frame<'_>, area: Rect, app: &mut AppState) {
                             .fg(Color::White)
                             .add_modifier(Modifier::BOLD),
                     ),
-                    Span::raw("  "),
+                    Span::raw("    "),
                     Span::styled(type_col, Style::default().fg(source_color(&entry.source))),
+                    if star_width > 0 {
+                        Span::raw("    ")
+                    } else {
+                        Span::raw("")
+                    },
+                    if star_width > 0 {
+                        Span::styled(
+                            pad_or_truncate(&star_col, star_width),
+                            Style::default().fg(Color::Yellow),
+                        )
+                    } else {
+                        Span::raw("")
+                    },
                     if desc_width == 0 {
                         Span::raw("")
                     } else {
@@ -1857,6 +1891,8 @@ fn is_browser_entry(entry: &Entry) -> bool {
 fn entry_detail(entry: &Entry) -> &str {
     if entry.source == "public" || entry.source == "private" {
         dockerhub_entry_description(entry)
+    } else if entry.source == "github" || entry.source == "gitlab" {
+        repo_entry_description(entry)
     } else {
         &entry.detail
     }
