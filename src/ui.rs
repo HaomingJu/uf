@@ -1,10 +1,10 @@
-use crate::config::{parse_refresh_interval, Config, RuntimeConfig};
+use crate::config::{normalize_gitlab_api_url, parse_refresh_interval, Config, RuntimeConfig};
 use crate::log;
 use crate::matchers::FuzzyMatcher;
 use crate::models::Entry;
 use crate::sources::{
     dockerhub_entry_description, dockerhub_entry_tags, repo_entry_description, repo_entry_stars,
-    test_github_connectivity,
+    test_github_connectivity, test_gitlab_connectivity,
 };
 use crossterm::cursor::{Hide, Show};
 use crossterm::execute;
@@ -668,6 +668,18 @@ fn handle_config_read_only_action(app: &mut AppState, item_index: usize) -> Resu
             app.message = "Opened GitHub token settings in browser.".to_string();
             Ok(true)
         }
+        ("GitLab", "Auth", "open token page") => {
+            let base = config_gitlab_web_base(&app.config);
+            let entry = Entry::new(
+                "GitLab token settings",
+                format!("{base}/-/user_settings/personal_access_tokens"),
+                "config",
+                "",
+            );
+            open_entry(&entry)?;
+            app.message = "Opened GitLab token settings in browser.".to_string();
+            Ok(true)
+        }
         ("GitHub", "Auth", "Connect") => {
             let config = app.config.clone();
             let tx = app.event_tx.clone();
@@ -678,6 +690,31 @@ fn handle_config_read_only_action(app: &mut AppState, item_index: usize) -> Resu
                     Ok(msg) => ("ok".to_string(), msg),
                     Err(err) => {
                         let current = if config.github_token.is_some() {
+                            "failed"
+                        } else {
+                            "missing"
+                        };
+                        (current.to_string(), err)
+                    }
+                };
+                let _ = tx.send(UiEvent::ConnectResult {
+                    item_index,
+                    current,
+                    message,
+                });
+            });
+            Ok(true)
+        }
+        ("GitLab", "Auth", "connect") => {
+            let config = app.config.clone();
+            let tx = app.event_tx.clone();
+            update_config_item_current(app, item_index, "testing...");
+            app.message = "Testing GitLab connectivity...".to_string();
+            std::thread::spawn(move || {
+                let (current, message) = match test_gitlab_connectivity(&config) {
+                    Ok(msg) => ("ok".to_string(), msg),
+                    Err(err) => {
+                        let current = if config.gitlab_token.is_some() {
                             "failed"
                         } else {
                             "missing"
@@ -770,7 +807,7 @@ fn apply_config_value(
         ("GitHub", "Auth", "User") => {
             app.config.github_user = optional_config_value(value);
         }
-        ("GitLab", "Auth", "Token") => {
+        ("GitLab", "Auth", "token") => {
             app.config.gitlab_token = optional_config_value(value);
         }
         ("DockerHub", "Auth", "Token") => {
@@ -782,8 +819,9 @@ fn apply_config_value(
         ("GitHub", "API", "Base URL") => {
             app.config.github_api = value.trim().to_string();
         }
-        ("GitLab", "API", "Base URL") => {
+        ("GitLab", "Auth", "Base URL") => {
             app.config.gitlab_api = value.trim().to_string();
+            app.config.gitlab_api = normalize_gitlab_api_url(&app.config.gitlab_api);
         }
         ("Browser", "Refresh", "Interval") => {
             app.config.history_refresh_interval =
@@ -1861,12 +1899,12 @@ fn config_value_hint(item: &ConfigItem) -> &'static str {
         | ("GitHub", "Refresh", "Interval")
         | ("GitLab", "Refresh", "Interval")
         | ("DockerHub", "Refresh", "Interval") => "seconds only, e.g. 5s or 60",
-        ("GitHub", "API", "Base URL") | ("GitLab", "API", "Base URL") => {
+        ("GitHub", "API", "Base URL") | ("GitLab", "Auth", "Base URL") => {
             "full URL, e.g. https://..."
         }
         ("GitHub", "Auth", "User") | ("DockerHub", "Auth", "Username") => "leave empty to clear",
         ("GitHub", "Auth", "Token")
-        | ("GitLab", "Auth", "Token")
+        | ("GitLab", "Auth", "token")
         | ("DockerHub", "Auth", "Token") => "hidden while typing",
         _ => "",
     }
@@ -2920,6 +2958,9 @@ impl AppState {
             ("GitHub", "Auth", "Connect", "ok") => Style::default().fg(Color::Green),
             ("GitHub", "Auth", "Connect", "failed") => Style::default().fg(Color::Red),
             ("GitHub", "Auth", "Connect", "missing") => Style::default().fg(Color::Yellow),
+            ("GitLab", "Auth", "connect", "ok") => Style::default().fg(Color::Green),
+            ("GitLab", "Auth", "connect", "failed") => Style::default().fg(Color::Red),
+            ("GitLab", "Auth", "connect", "missing") => Style::default().fg(Color::Yellow),
             _ => Style::default().fg(Color::Cyan),
         }
     }
@@ -2999,11 +3040,38 @@ fn build_config_items(config: &Config) -> Vec<ConfigItem> {
         ConfigItem::new(
             "GitLab",
             "Auth",
-            "Token",
+            "Base URL",
+            config.gitlab_api.clone(),
+            "--gitlab-api <url> or GITLAB_API",
+            "Set this for self-hosted GitLab. Both https://gitlab.example.com and https://gitlab.example.com/api/v4 are accepted.",
+            ConfigEditKind::Text,
+        ),
+        ConfigItem::new(
+            "GitLab",
+            "Auth",
+            "open token page",
+            "browser",
+            "derived from Base URL",
+            "Open GitLab personal access token settings in the browser.",
+            ConfigEditKind::ReadOnly,
+        ),
+        ConfigItem::new(
+            "GitLab",
+            "Auth",
+            "token",
             secret_status(config.gitlab_token.as_deref()),
             "--gitlab-token <token> or GITLAB_TOKEN",
             "Recommended acquisition when glab is available: glab auth login, then export GITLAB_TOKEN=$(glab auth token). Token should have read_api scope.",
             ConfigEditKind::Secret,
+        ),
+        ConfigItem::new(
+            "GitLab",
+            "Auth",
+            "connect",
+            "not tested",
+            "GitLab connectivity test",
+            "Validate base URL, token loading, API reachability, and project access.",
+            ConfigEditKind::ReadOnly,
         ),
         ConfigItem::new(
             "DockerHub",
@@ -3021,15 +3089,6 @@ fn build_config_items(config: &Config) -> Vec<ConfigItem> {
             optional_value(config.dockerhub_username.as_deref()),
             "--dockerhub-user <user> or DOCKERHUB_USERNAME",
             "Required for DockerHub repository search.",
-            ConfigEditKind::Text,
-        ),
-        ConfigItem::new(
-            "GitLab",
-            "API",
-            "Base URL",
-            config.gitlab_api.clone(),
-            "--gitlab-api <url> or GITLAB_API",
-            "Set this for self-hosted GitLab, for example https://gitlab.example.com/api/v4.",
             ConfigEditKind::Text,
         ),
         ConfigItem::new(
@@ -3117,6 +3176,14 @@ fn optional_value(value: Option<&str>) -> String {
     value
         .filter(|value| !value.is_empty())
         .unwrap_or("not set")
+        .to_string()
+}
+
+fn config_gitlab_web_base(config: &Config) -> String {
+    config
+        .gitlab_api
+        .trim_end_matches('/')
+        .trim_end_matches("/api/v4")
         .to_string()
 }
 
@@ -3645,6 +3712,22 @@ mod tests {
         assert_eq!(
             github_settings,
             vec!["Enabled", "Interval", "Token", "Open token page", "Connect"]
+        );
+    }
+
+    #[test]
+    fn gitlab_auth_group_contains_base_url_and_connect() {
+        let app = app_state(Vec::new());
+        let gitlab_auth: Vec<_> = app
+            .config_items
+            .iter()
+            .filter(|item| item.level1 == "GitLab" && item.level2 == "Auth")
+            .map(|item| item.level3.as_str())
+            .collect();
+
+        assert_eq!(
+            gitlab_auth,
+            vec!["Base URL", "open token page", "token", "connect"]
         );
     }
 

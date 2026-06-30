@@ -402,6 +402,46 @@ pub fn test_github_connectivity(config: &Config) -> Result<String, String> {
     }
 }
 
+pub fn test_gitlab_connectivity(config: &Config) -> Result<String, String> {
+    let Some(token) = config.gitlab_token.as_deref() else {
+        return Err("GitLab token is missing.".to_string());
+    };
+
+    let user_url = format!("{}/user", config.gitlab_api.trim_end_matches('/'));
+    let user_body = gitlab_api_get(&user_url, token)?;
+    let user_json: JsonValue =
+        serde_json::from_str(&user_body).map_err(|err| format!("parse GitLab user JSON: {err}"))?;
+    if let Some(message) = clean_json_str(user_json.get("message")) {
+        if !message.is_empty() {
+            return Err(format!("GitLab user check failed: {message}"));
+        }
+    }
+    let username = clean_json_str(user_json.get("username"))
+        .or_else(|| clean_json_str(user_json.get("name")))
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| "GitLab user check failed: username not found.".to_string())?;
+
+    let projects_url = format!(
+        "{}/projects?per_page=1&page=1&membership=true&min_access_level=20",
+        config.gitlab_api.trim_end_matches('/')
+    );
+    let projects_body = gitlab_api_get(&projects_url, token)?;
+    let projects_json: JsonValue = serde_json::from_str(&projects_body)
+        .map_err(|err| format!("parse GitLab projects JSON: {err}"))?;
+    match projects_json {
+        JsonValue::Array(_) => Ok(format!("Connected as {username}. Project access OK.")),
+        JsonValue::Object(ref obj) => {
+            let message = clean_json_str(obj.get("message")).unwrap_or_default();
+            if message.is_empty() {
+                Err("GitLab project check failed.".to_string())
+            } else {
+                Err(format!("GitLab project check failed: {message}"))
+            }
+        }
+        _ => Err("GitLab project check returned an unexpected response.".to_string()),
+    }
+}
+
 pub fn fetch_gitlab_page(config: &Config, page: usize) -> Result<Vec<Entry>, String> {
     let mut url = format!(
         "{}/projects?per_page=100&page={}&order_by=last_activity_at&sort=desc",
@@ -415,6 +455,18 @@ pub fn fetch_gitlab_page(config: &Config, page: usize) -> Result<Vec<Entry>, Str
     }
 
     fetch_gitlab_rows(&url, config.gitlab_token.as_deref())
+}
+
+fn gitlab_api_get(url: &str, token: &str) -> Result<String, String> {
+    let auth_header = format!("PRIVATE-TOKEN: {token}");
+    let args = vec![
+        "-sSL",
+        "-H",
+        "User-Agent: web-fzf",
+        "-H",
+        auth_header.as_str(),
+    ];
+    command_output_with_stderr("curl", &with_url(args, url))
 }
 
 fn load_chromium_family() -> Result<Vec<Entry>, String> {

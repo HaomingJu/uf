@@ -57,6 +57,7 @@ impl Config {
         let mut config = Self::default();
         config.apply_file_overrides();
         config.apply_env_overrides();
+        config.normalize_urls();
         config
     }
 
@@ -112,6 +113,10 @@ impl Config {
         if let Some(value) = preview_flag_from_env() {
             self.preview_enabled = value;
         }
+    }
+
+    fn normalize_urls(&mut self) {
+        self.gitlab_api = normalize_gitlab_api_url(&self.gitlab_api);
     }
 }
 
@@ -198,6 +203,18 @@ pub fn parse_refresh_interval(value: &str) -> Option<Duration> {
         return None;
     }
     Some(Duration::from_secs(seconds))
+}
+
+pub fn normalize_gitlab_api_url(value: &str) -> String {
+    let trimmed = value.trim().trim_end_matches('/');
+    if trimmed.is_empty() {
+        return "https://gitlab.com/api/v4".to_string();
+    }
+    if trimmed.ends_with("/api/v4") {
+        trimmed.to_string()
+    } else {
+        format!("{trimmed}/api/v4")
+    }
 }
 
 pub fn config_file_path() -> Option<PathBuf> {
@@ -321,7 +338,10 @@ fn json_optional_string(value: &JsonValue, key: &str) -> Option<Option<String>> 
 
 #[cfg(test)]
 mod tests {
-    use super::{apply_json_overrides, format_persisted_config, parse_refresh_interval, Config};
+    use super::{
+        apply_json_overrides, format_persisted_config, normalize_gitlab_api_url,
+        parse_refresh_interval, Config,
+    };
     use serde_json::Value as JsonValue;
     use std::time::Duration;
 
@@ -359,5 +379,25 @@ mod tests {
         assert_eq!(loaded.github_user.as_deref(), Some("octocat"));
         assert!(loaded.preview_enabled);
         assert_eq!(loaded.github_refresh_interval, Duration::from_secs(90));
+    }
+
+    #[test]
+    fn normalizes_gitlab_base_and_api_urls() {
+        assert_eq!(
+            normalize_gitlab_api_url("https://gitlab.example.com"),
+            "https://gitlab.example.com/api/v4"
+        );
+        assert_eq!(
+            normalize_gitlab_api_url("https://gitlab.example.com/"),
+            "https://gitlab.example.com/api/v4"
+        );
+        assert_eq!(
+            normalize_gitlab_api_url("https://gitlab.example.com/api/v4"),
+            "https://gitlab.example.com/api/v4"
+        );
+        assert_eq!(
+            normalize_gitlab_api_url("https://gitlab.example.com/api/v4/"),
+            "https://gitlab.example.com/api/v4"
+        );
     }
 }
