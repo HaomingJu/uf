@@ -26,6 +26,42 @@ pub struct Config {
     pub dockerhub_refresh_interval: Duration,
     pub preview_enabled: bool,
     pub debug: bool,
+    pub language: Language,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum Language {
+    English,
+    Chinese,
+    Japanese,
+    Korean,
+    French,
+    Russian,
+}
+
+impl Language {
+    pub fn code(self) -> &'static str {
+        match self {
+            Language::English => "en",
+            Language::Chinese => "zh",
+            Language::Japanese => "ja",
+            Language::Korean => "ko",
+            Language::French => "fr",
+            Language::Russian => "ru",
+        }
+    }
+
+    pub fn from_code(value: &str) -> Option<Self> {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "en" | "english" => Some(Language::English),
+            "zh" | "zh-cn" | "zh-hans" | "chinese" => Some(Language::Chinese),
+            "ja" | "japanese" => Some(Language::Japanese),
+            "ko" | "korean" => Some(Language::Korean),
+            "fr" | "french" => Some(Language::French),
+            "ru" | "russian" => Some(Language::Russian),
+            _ => None,
+        }
+    }
 }
 
 impl Default for Config {
@@ -48,6 +84,7 @@ impl Default for Config {
             dockerhub_refresh_interval: Duration::from_secs(60),
             preview_enabled: preview_flag_from_env().unwrap_or(false),
             debug: false,
+            language: Language::English,
         }
     }
 }
@@ -255,6 +292,7 @@ fn format_persisted_config(config: &Config) -> String {
         "dockerhub_refresh_interval": config.dockerhub_refresh_interval.as_secs(),
         "preview_enabled": config.preview_enabled,
         "debug": config.debug,
+        "language": config.language.code(),
     })
     .to_string()
 }
@@ -311,6 +349,9 @@ fn apply_json_overrides(config: &mut Config, value: &JsonValue) {
     if let Some(debug) = json_bool(value, "debug") {
         config.debug = debug;
     }
+    if let Some(language) = json_string(value, "language").and_then(|value| Language::from_code(&value)) {
+        config.language = language;
+    }
 }
 
 fn json_bool(value: &JsonValue, key: &str) -> Option<bool> {
@@ -340,7 +381,7 @@ fn json_optional_string(value: &JsonValue, key: &str) -> Option<Option<String>> 
 mod tests {
     use super::{
         apply_json_overrides, format_persisted_config, normalize_gitlab_api_url,
-        parse_refresh_interval, Config,
+        parse_refresh_interval, Config, Language,
     };
     use serde_json::Value as JsonValue;
     use std::time::Duration;
@@ -369,6 +410,7 @@ mod tests {
         config.github_user = Some("octocat".to_string());
         config.preview_enabled = true;
         config.github_refresh_interval = Duration::from_secs(90);
+        config.language = Language::Japanese;
 
         let text = format_persisted_config(&config);
         let value: JsonValue = serde_json::from_str(&text).unwrap();
@@ -379,6 +421,23 @@ mod tests {
         assert_eq!(loaded.github_user.as_deref(), Some("octocat"));
         assert!(loaded.preview_enabled);
         assert_eq!(loaded.github_refresh_interval, Duration::from_secs(90));
+        assert_eq!(loaded.language, Language::Japanese);
+    }
+
+    #[test]
+    fn language_defaults_to_english() {
+        let config = Config::default();
+        assert_eq!(config.language, Language::English);
+    }
+
+    #[test]
+    fn invalid_language_keeps_default_english() {
+        let value: JsonValue = serde_json::json!({
+            "language": "invalid-language"
+        });
+        let mut loaded = Config::default();
+        apply_json_overrides(&mut loaded, &value);
+        assert_eq!(loaded.language, Language::English);
     }
 
     #[test]

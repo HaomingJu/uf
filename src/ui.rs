@@ -1,4 +1,6 @@
-use crate::config::{normalize_gitlab_api_url, parse_refresh_interval, Config, RuntimeConfig};
+use crate::config::{
+    normalize_gitlab_api_url, parse_refresh_interval, Config, Language, RuntimeConfig,
+};
 use crate::log;
 use crate::matchers::FuzzyMatcher;
 use crate::models::Entry;
@@ -354,6 +356,7 @@ enum AppModeKind {
     ActionMenu,
     RepoMenu,
     ConfigEdit,
+    ConfigSelect,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -379,6 +382,8 @@ enum Action {
     ConfirmRepoAction,
     CommitConfigEdit,
     CancelConfigEdit,
+    CommitConfigSelect,
+    CancelConfigSelect,
     ConfigEditCursorLeft,
     ConfigEditCursorRight,
     ConfigEditCursorHome,
@@ -394,6 +399,7 @@ fn resolve_action(mode: AppModeKind, key: InputKey) -> Option<Action> {
         AppModeKind::ActionMenu => resolve_action_menu_action(key),
         AppModeKind::RepoMenu => resolve_repo_menu_action(key),
         AppModeKind::ConfigEdit => resolve_config_edit_action(key),
+        AppModeKind::ConfigSelect => resolve_config_select_action(key),
     }
 }
 
@@ -499,6 +505,22 @@ fn resolve_config_edit_action(key: InputKey) -> Option<Action> {
     }
 }
 
+fn resolve_config_select_action(key: InputKey) -> Option<Action> {
+    match key.code {
+        InputCode::Esc => Some(Action::CancelConfigSelect),
+        InputCode::Enter => Some(Action::CommitConfigSelect),
+        InputCode::Up | InputCode::Char('k') if !key.ctrl => Some(Action::MoveUp),
+        InputCode::Down | InputCode::Char('j') if !key.ctrl => Some(Action::MoveDown),
+        InputCode::Char('p') | InputCode::Char('k') if key.ctrl => Some(Action::MoveUp),
+        InputCode::Char('n') | InputCode::Char('j') if key.ctrl => Some(Action::MoveDown),
+        InputCode::PageUp => Some(Action::PageUp),
+        InputCode::PageDown => Some(Action::PageDown),
+        InputCode::Char('u') if key.ctrl => Some(Action::PageUp),
+        InputCode::Char('d') if key.ctrl => Some(Action::PageDown),
+        _ => None,
+    }
+}
+
 fn apply_action(
     app: &mut AppState,
     action: Action,
@@ -550,6 +572,8 @@ fn apply_action(
         Action::ConfirmRepoAction => confirm_repo_action(app)?,
         Action::CommitConfigEdit => commit_config_edit(app),
         Action::CancelConfigEdit => cancel_config_edit(app),
+        Action::CommitConfigSelect => commit_config_select(app),
+        Action::CancelConfigSelect => cancel_config_select(app),
         Action::ConfigEditCursorLeft => app.config_edit_cursor_left(),
         Action::ConfigEditCursorRight => app.config_edit_cursor_right(),
         Action::ConfigEditCursorHome => app.config_edit_cursor_home(),
@@ -604,16 +628,17 @@ fn start_config_edit(app: &mut AppState) {
     let edit_kind = app.config_items[item_index].edit_kind;
     match edit_kind {
         ConfigEditKind::Toggle => {
-            let (level1, level2, level3, enabled) = {
+            let (key, level1, level2, level3, enabled) = {
                 let item = &app.config_items[item_index];
                 (
+                    item.key,
                     item.level1.clone(),
                     item.level2.clone(),
                     item.level3.clone(),
-                    item.current != "enabled",
+                    !config_current_is_enabled(item),
                 )
             };
-            if let Err(err) = apply_config_toggle(app, &level1, &level2, &level3, enabled) {
+            if let Err(err) = apply_config_toggle_by_key_result(app, key, enabled) {
                 app.message = err;
                 return;
             }
@@ -621,6 +646,15 @@ fn start_config_edit(app: &mut AppState) {
             app.recompute();
         }
         ConfigEditKind::Text | ConfigEditKind::Secret => {
+            if app.config_items[item_index].key == ConfigKey::SystemLanguage {
+                app.mode = AppMode::ConfigSelect {
+                    item_index,
+                    options: language_options(app.config.language),
+                    selected: language_option_index(app.config.language),
+                };
+                app.message = "Select a language. Enter to save, Esc to cancel.".to_string();
+                return;
+            }
             let hint = config_value_hint(&app.config_items[item_index]);
             app.mode = AppMode::ConfigEdit {
                 item_index,
@@ -652,12 +686,8 @@ fn handle_config_read_only_action(app: &mut AppState, item_index: usize) -> Resu
         return Ok(false);
     };
 
-    match (
-        item.level1.as_str(),
-        item.level2.as_str(),
-        item.level3.as_str(),
-    ) {
-        ("GitHub", "Auth", "Open token page") => {
+    match item.key {
+        ConfigKey::GitHubTokenPage => {
             let entry = Entry::new(
                 "GitHub token settings",
                 "https://github.com/settings/tokens",
@@ -668,7 +698,7 @@ fn handle_config_read_only_action(app: &mut AppState, item_index: usize) -> Resu
             app.message = "Opened GitHub token settings in browser.".to_string();
             Ok(true)
         }
-        ("GitLab", "Auth", "open token page") => {
+        ConfigKey::GitLabTokenPage => {
             let base = config_gitlab_web_base(&app.config);
             let entry = Entry::new(
                 "GitLab token settings",
@@ -680,7 +710,7 @@ fn handle_config_read_only_action(app: &mut AppState, item_index: usize) -> Resu
             app.message = "Opened GitLab token settings in browser.".to_string();
             Ok(true)
         }
-        ("GitHub", "Auth", "Connect") => {
+        ConfigKey::GitHubConnect => {
             let config = app.config.clone();
             let tx = app.event_tx.clone();
             update_config_item_current(app, item_index, "testing...");
@@ -705,7 +735,7 @@ fn handle_config_read_only_action(app: &mut AppState, item_index: usize) -> Resu
             });
             Ok(true)
         }
-        ("GitLab", "Auth", "connect") => {
+        ConfigKey::GitLabConnect => {
             let config = app.config.clone();
             let tx = app.event_tx.clone();
             update_config_item_current(app, item_index, "testing...");
@@ -754,15 +784,14 @@ fn commit_config_edit(app: &mut AppState) {
         app.mode = AppMode::Normal;
         return;
     };
+    let key = item.key;
     let level1 = item.level1.clone();
     let level2 = item.level2.clone();
     let level3 = item.level3.clone();
     let edit_kind = item.edit_kind;
 
     let result = match edit_kind {
-        ConfigEditKind::Text | ConfigEditKind::Secret => {
-            apply_config_value(app, &level1, &level2, &level3, &buffer)
-        }
+        ConfigEditKind::Text | ConfigEditKind::Secret => apply_config_value_by_key(app, key, &buffer),
         ConfigEditKind::Toggle | ConfigEditKind::ReadOnly => Ok(()),
     };
     if let Err(err) = result {
@@ -773,84 +802,96 @@ fn commit_config_edit(app: &mut AppState) {
     app.mode = AppMode::Normal;
 }
 
-fn apply_config_toggle(
+fn apply_config_toggle_by_key_result(
     app: &mut AppState,
-    level1: &str,
-    level2: &str,
-    level3: &str,
+    key: ConfigKey,
     enabled: bool,
 ) -> Result<(), String> {
-    match (level1, level2, level3) {
-        ("Browser", "Source", "Enabled")
-        | ("GitHub", "Source", "Enabled")
-        | ("GitLab", "Source", "Enabled")
-        | ("DockerHub", "Source", "Enabled") => app.set_source_enabled(level1, enabled),
-        ("System", "Display", "Preview pane") => app.config.preview_enabled = enabled,
-        ("System", "Diagnostics", "Debug logging") => app.config.debug = enabled,
+    apply_config_toggle_by_key(app, key, enabled);
+    app.sync_config_items();
+    app.persist_config()
+}
+
+fn apply_config_toggle_by_key(app: &mut AppState, key: ConfigKey, enabled: bool) {
+    match key {
+        ConfigKey::BrowserEnabled => app.set_source_enabled("Browser", enabled),
+        ConfigKey::GitHubEnabled => app.set_source_enabled("GitHub", enabled),
+        ConfigKey::GitLabEnabled => app.set_source_enabled("GitLab", enabled),
+        ConfigKey::DockerHubEnabled => app.set_source_enabled("DockerHub", enabled),
+        ConfigKey::SystemPreviewPane => app.config.preview_enabled = enabled,
+        ConfigKey::SystemDebugLogging => app.config.debug = enabled,
+        _ => {}
+    }
+}
+
+fn apply_config_value_by_key(app: &mut AppState, key: ConfigKey, value: &str) -> Result<(), String> {
+    match key {
+        ConfigKey::GitHubToken => {
+            app.config.github_token = optional_config_value(value);
+        }
+        ConfigKey::GitLabToken => {
+            app.config.gitlab_token = optional_config_value(value);
+        }
+        ConfigKey::DockerHubToken => {
+            app.config.dockerhub_token = optional_config_value(value);
+        }
+        ConfigKey::DockerHubUsername => {
+            app.config.dockerhub_username = optional_config_value(value);
+        }
+        ConfigKey::GitLabBaseUrl => {
+            app.config.gitlab_api = value.trim().to_string();
+            app.config.gitlab_api = normalize_gitlab_api_url(&app.config.gitlab_api);
+        }
+        ConfigKey::BrowserRefreshInterval => {
+            app.config.history_refresh_interval = parse_refresh_interval(value).ok_or_else(|| {
+                "Browser refresh must be in seconds, for example 5s or 60.".to_string()
+            })?;
+        }
+        ConfigKey::GitHubRefreshInterval => {
+            app.config.github_refresh_interval = parse_refresh_interval(value).ok_or_else(|| {
+                "GitHub refresh must be in seconds, for example 5s or 60.".to_string()
+            })?;
+        }
+        ConfigKey::GitLabRefreshInterval => {
+            app.config.gitlab_refresh_interval = parse_refresh_interval(value).ok_or_else(|| {
+                "GitLab refresh must be in seconds, for example 5s or 60.".to_string()
+            })?;
+        }
+        ConfigKey::DockerHubRefreshInterval => {
+            app.config.dockerhub_refresh_interval =
+                parse_refresh_interval(value).ok_or_else(|| {
+                    "DockerHub refresh must be in seconds, for example 5s or 60.".to_string()
+                })?;
+        }
+        ConfigKey::SystemLanguage => {
+            app.config.language = Language::from_code(value)
+                .ok_or_else(|| "Language must be one of: en, zh, ja, ko, fr, ru.".to_string())?;
+        }
         _ => {}
     }
     app.sync_config_items();
     app.persist_config()
 }
 
-fn apply_config_value(
-    app: &mut AppState,
-    level1: &str,
-    level2: &str,
-    level3: &str,
-    value: &str,
-) -> Result<(), String> {
-    match (level1, level2, level3) {
-        ("GitHub", "Auth", "Token") => {
-            app.config.github_token = optional_config_value(value);
-        }
-        ("GitHub", "Auth", "User") => {
-            app.config.github_user = optional_config_value(value);
-        }
-        ("GitLab", "Auth", "token") => {
-            app.config.gitlab_token = optional_config_value(value);
-        }
-        ("DockerHub", "Auth", "Token") => {
-            app.config.dockerhub_token = optional_config_value(value);
-        }
-        ("DockerHub", "Auth", "Username") => {
-            app.config.dockerhub_username = optional_config_value(value);
-        }
-        ("GitHub", "API", "Base URL") => {
-            app.config.github_api = value.trim().to_string();
-        }
-        ("GitLab", "Auth", "Base URL") => {
-            app.config.gitlab_api = value.trim().to_string();
-            app.config.gitlab_api = normalize_gitlab_api_url(&app.config.gitlab_api);
-        }
-        ("Browser", "Refresh", "Interval") => {
-            app.config.history_refresh_interval =
-                parse_refresh_interval(value).ok_or_else(|| {
-                    "Browser refresh must be in seconds, for example 5s or 60.".to_string()
-                })?;
-        }
-        ("GitHub", "Refresh", "Interval") => {
-            app.config.github_refresh_interval =
-                parse_refresh_interval(value).ok_or_else(|| {
-                    "GitHub refresh must be in seconds, for example 5s or 60.".to_string()
-                })?;
-        }
-        ("GitLab", "Refresh", "Interval") => {
-            app.config.gitlab_refresh_interval =
-                parse_refresh_interval(value).ok_or_else(|| {
-                    "GitLab refresh must be in seconds, for example 5s or 60.".to_string()
-                })?;
-        }
-        ("DockerHub", "Refresh", "Interval") => {
-            app.config.dockerhub_refresh_interval =
-                parse_refresh_interval(value).ok_or_else(|| {
-                    "DockerHub refresh must be in seconds, for example 5s or 60.".to_string()
-                })?;
-        }
-        _ => {}
-    }
-    app.sync_config_items();
-    app.persist_config()
+fn config_current_is_enabled(item: &ConfigItem) -> bool {
+    matches!(
+        item.key,
+        ConfigKey::BrowserEnabled
+            | ConfigKey::GitHubEnabled
+            | ConfigKey::GitLabEnabled
+            | ConfigKey::DockerHubEnabled
+            | ConfigKey::SystemPreviewPane
+            | ConfigKey::SystemDebugLogging
+    ) && [
+        Language::English,
+        Language::Chinese,
+        Language::Japanese,
+        Language::Korean,
+        Language::French,
+        Language::Russian,
+    ]
+    .into_iter()
+    .any(|lang| item.current == localized_enabled_text(lang, true))
 }
 
 fn optional_config_value(value: &str) -> Option<String> {
@@ -867,6 +908,41 @@ fn cancel_config_edit(app: &mut AppState) {
     app.message = "Config edit cancelled.".to_string();
 }
 
+fn commit_config_select(app: &mut AppState) {
+    let AppMode::ConfigSelect {
+        item_index,
+        options,
+        selected,
+    } = &app.mode
+    else {
+        return;
+    };
+    let item_index = *item_index;
+    let selected = *selected;
+    let Some(option) = options.get(selected) else {
+        return;
+    };
+    let Some(item) = app.config_items.get(item_index) else {
+        app.mode = AppMode::Normal;
+        return;
+    };
+    let key = item.key;
+    let level1 = item.level1.clone();
+    let level2 = item.level2.clone();
+    let level3 = item.level3.clone();
+    if let Err(err) = apply_config_value_by_key(app, key, option.code) {
+        app.message = err;
+        return;
+    }
+    app.message = format!("Updated {} / {} / {}.", level1, level2, level3);
+    app.mode = AppMode::Normal;
+}
+
+fn cancel_config_select(app: &mut AppState) {
+    app.mode = AppMode::Normal;
+    app.message = "Config selection cancelled.".to_string();
+}
+
 fn move_selection_up(app: &mut AppState) {
     match app.mode {
         AppMode::Normal if app.tab == Tab::Config => app.move_config_up(),
@@ -878,6 +954,13 @@ fn move_selection_up(app: &mut AppState) {
             ref mut selected, ..
         }
         | AppMode::RepoMenu {
+            ref mut selected, ..
+        } => {
+            if *selected > 0 {
+                *selected -= 1;
+            }
+        }
+        AppMode::ConfigSelect {
             ref mut selected, ..
         } => {
             if *selected > 0 {
@@ -924,6 +1007,15 @@ fn move_selection_down(app: &mut AppState) {
                 *selected += 1;
             }
         }
+        AppMode::ConfigSelect {
+            ref options,
+            ref mut selected,
+            ..
+        } => {
+            if *selected + 1 < options.len() {
+                *selected += 1;
+            }
+        }
         AppMode::ConfigEdit { .. } => {}
     }
 }
@@ -939,6 +1031,11 @@ fn page_selection_up(app: &mut AppState) {
             ref mut selected, ..
         }
         | AppMode::RepoMenu {
+            ref mut selected, ..
+        } => {
+            *selected = selected.saturating_sub(10);
+        }
+        AppMode::ConfigSelect {
             ref mut selected, ..
         } => {
             *selected = selected.saturating_sub(10);
@@ -981,6 +1078,15 @@ fn page_selection_down(app: &mut AppState) {
             let limit = repo_action_labels(&repo_source).len();
             if limit > 0 {
                 *selected = (*selected + 10).min(limit - 1);
+            }
+        }
+        AppMode::ConfigSelect {
+            ref options,
+            ref mut selected,
+            ..
+        } => {
+            if !options.is_empty() {
+                *selected = (*selected + 10).min(options.len() - 1);
             }
         }
         AppMode::ConfigEdit { .. } => {}
@@ -1203,6 +1309,10 @@ fn render(frame: &mut Frame<'_>, app: &mut AppState) {
         AppModeKind::ConfigEdit => {
             render_config(frame, layout[2], app);
             render_config_editor(frame, size, app);
+        }
+        AppModeKind::ConfigSelect => {
+            render_config(frame, layout[2], app);
+            render_config_select(frame, size, app);
         }
         AppModeKind::Normal => {
             if app.tab == Tab::Config {
@@ -1551,6 +1661,7 @@ fn render_footer(frame: &mut Frame<'_>, area: Rect, app: &AppState) {
             "Up/Down=move  Ctrl+U/D=page  Enter=confirm  Backspace=back"
         }
         AppMode::ConfigEdit { .. } => "Type=value  Enter=save  Esc=cancel  Backspace=delete",
+        AppMode::ConfigSelect { .. } => "Up/Down=move  Enter=save  Esc=cancel",
         AppMode::Normal => {
             if app.tab == Tab::Config {
                 "Up/Down=select  Enter=edit/toggle/fold  Type=filter  Ctrl+B=hide Config  Esc=quit"
@@ -1754,7 +1865,7 @@ fn render_config(frame: &mut Frame<'_>, area: Rect, app: &AppState) {
                     ConfigDisplayRow::Item(idx) => {
                         let item = &app.config_items[idx];
                         let current_value = item.current.clone();
-                        let setting_label = if item.level2 == "Auth" {
+                        let setting_label = if is_auth_group_label(&item.level2) {
                             format!("      {}", item.level3)
                         } else {
                             format!("  {}", item.level3)
@@ -1889,29 +2000,113 @@ fn render_config_editor(frame: &mut Frame<'_>, area: Rect, app: &AppState) {
     frame.set_cursor_position(Position::new(cursor_x, value_row_y));
 }
 
+fn render_config_select(frame: &mut Frame<'_>, area: Rect, app: &AppState) {
+    let AppMode::ConfigSelect {
+        item_index,
+        options,
+        selected,
+    } = &app.mode
+    else {
+        return;
+    };
+    let Some(item) = app.config_items.get(*item_index) else {
+        return;
+    };
+
+    let width = area.width.min(52).max(34);
+    let height = (options.len() as u16 + 5).min(area.height.saturating_sub(2)).max(8);
+    let x = area.x + area.width.saturating_sub(width) / 2;
+    let y = area.y + area.height.saturating_sub(height) / 2;
+    let popup = Rect::new(x, y, width, height);
+
+    let items: Vec<ListItem> = options
+        .iter()
+        .map(|option| {
+            ListItem::new(Line::from(vec![
+                Span::styled(option.label, Style::default().fg(Color::White)),
+                Span::raw("  "),
+                Span::styled(option.code, Style::default().fg(Color::DarkGray)),
+            ]))
+        })
+        .collect();
+
+    let mut state = ListState::default();
+    state.select(Some(*selected));
+
+    frame.render_widget(Clear, popup);
+    frame.render_widget(
+        Paragraph::new(vec![
+            Line::from(vec![
+                Span::styled("Path", Style::default().fg(Color::Cyan)),
+                Span::raw(":  "),
+                Span::styled(
+                    format!("{} / {} / {}", item.level1, item.level2, item.level3),
+                    Style::default().fg(Color::White),
+                ),
+            ]),
+            Line::from(vec![
+                Span::styled("Now", Style::default().fg(Color::Cyan)),
+                Span::raw(":    "),
+                Span::styled(item.current.clone(), Style::default().fg(Color::DarkGray)),
+            ]),
+        ])
+        .block(
+            Block::default()
+                .title(Span::styled(
+                    " Select Language ",
+                    Style::default()
+                        .fg(Color::Cyan)
+                        .add_modifier(Modifier::BOLD),
+                ))
+                .borders(Borders::ALL)
+                .border_style(Style::default().fg(Color::Cyan)),
+        ),
+        popup,
+    );
+
+    let list_area = Rect::new(
+        popup.x.saturating_add(1),
+        popup.y.saturating_add(3),
+        popup.width.saturating_sub(2),
+        popup.height.saturating_sub(4),
+    );
+
+    let list = List::new(items)
+        .highlight_style(
+            Style::default()
+                .fg(Color::Black)
+                .bg(Color::Cyan)
+                .add_modifier(Modifier::BOLD),
+        )
+        .highlight_symbol("❯ ");
+
+    frame.render_stateful_widget(list, list_area, &mut state);
+}
+
 fn config_value_hint(item: &ConfigItem) -> &'static str {
-    match (
-        item.level1.as_str(),
-        item.level2.as_str(),
-        item.level3.as_str(),
-    ) {
-        ("Browser", "Refresh", "Interval")
-        | ("GitHub", "Refresh", "Interval")
-        | ("GitLab", "Refresh", "Interval")
-        | ("DockerHub", "Refresh", "Interval") => "seconds only, e.g. 5s or 60",
-        ("GitHub", "API", "Base URL") | ("GitLab", "Auth", "Base URL") => {
-            "full URL, e.g. https://..."
+    match item.key {
+        ConfigKey::BrowserRefreshInterval
+        | ConfigKey::GitHubRefreshInterval
+        | ConfigKey::GitLabRefreshInterval
+        | ConfigKey::DockerHubRefreshInterval => "seconds only, e.g. 5s or 60",
+        ConfigKey::GitLabBaseUrl => "full URL, e.g. https://...",
+        ConfigKey::DockerHubUsername => "leave empty to clear",
+        ConfigKey::GitHubToken | ConfigKey::GitLabToken | ConfigKey::DockerHubToken => {
+            "hidden while typing"
         }
-        ("GitHub", "Auth", "User") | ("DockerHub", "Auth", "Username") => "leave empty to clear",
-        ("GitHub", "Auth", "Token")
-        | ("GitLab", "Auth", "token")
-        | ("DockerHub", "Auth", "Token") => "hidden while typing",
+        ConfigKey::SystemLanguage => "en, zh, ja, ko, fr, ru",
         _ => "",
     }
 }
 
 fn config_edit_is_refresh_interval(item: &ConfigItem) -> bool {
-    item.level2 == "Refresh" && item.level3 == "Interval"
+    matches!(
+        item.key,
+        ConfigKey::BrowserRefreshInterval
+            | ConfigKey::GitHubRefreshInterval
+            | ConfigKey::GitLabRefreshInterval
+            | ConfigKey::DockerHubRefreshInterval
+    )
 }
 
 fn source_color(source: &str) -> Color {
@@ -2178,8 +2373,6 @@ enum ConfigDisplayRow {
     Item(usize),
 }
 
-const CONFIG_GROUP_ORDER: [&str; 5] = ["Browser", "GitHub", "GitLab", "DockerHub", "System"];
-
 fn config_group_key(group: &str) -> String {
     group.to_string()
 }
@@ -2211,7 +2404,8 @@ fn config_display_rows_with_collapsed(
     }
     let mut rows = Vec::new();
 
-    for group in CONFIG_GROUP_ORDER {
+    let group_order = localized_group_order(items);
+    for group in group_order {
         let group_items: Vec<usize> = ranked
             .iter()
             .copied()
@@ -2240,19 +2434,19 @@ fn config_display_rows_with_collapsed(
             if current_level2.as_deref() != Some(level2.as_str()) {
                 current_level2 = Some(level2.clone());
             }
-            if level2 == "Auth" {
-                let just_started_auth = matches!(current_level2.as_deref(), Some("Auth"))
+            if is_auth_group_label(&level2) {
+                let just_started_auth = matches!(current_level2.as_deref(), Some(current) if is_auth_group_label(current))
                     && !matches!(
                         rows.last(),
-                        Some(ConfigDisplayRow::Subgroup(name)) if name == "Auth"
+                        Some(ConfigDisplayRow::Subgroup(name)) if is_auth_group_label(name)
                     )
                     && !matches!(
                         rows.last(),
                         Some(ConfigDisplayRow::Item(prev_idx))
-                            if items[*prev_idx].level1 == group && items[*prev_idx].level2 == "Auth"
+                            if items[*prev_idx].level1 == group && is_auth_group_label(&items[*prev_idx].level2)
                     );
                 if just_started_auth {
-                    subgroup_collapsed = is_collapsed(&config_subgroup_key(group, "Auth"));
+                    subgroup_collapsed = is_collapsed(&config_subgroup_key(group, &level2));
                     rows.push(ConfigDisplayRow::Subgroup(level2));
                 }
                 if subgroup_collapsed {
@@ -2264,7 +2458,7 @@ fn config_display_rows_with_collapsed(
     }
 
     for idx in ranked {
-        if CONFIG_GROUP_ORDER
+        if localized_group_order(items)
             .iter()
             .any(|group| items[idx].level1 == *group)
         {
@@ -2276,9 +2470,9 @@ fn config_display_rows_with_collapsed(
         if group_collapsed {
             continue;
         }
-        if items[idx].level2 == "Auth" {
+        if is_auth_group_label(&items[idx].level2) {
             rows.push(ConfigDisplayRow::Subgroup(items[idx].level2.clone()));
-            if is_collapsed(&config_subgroup_key(&group, "Auth")) {
+            if is_collapsed(&config_subgroup_key(&group, &items[idx].level2)) {
                 continue;
             }
         }
@@ -2289,12 +2483,48 @@ fn config_display_rows_with_collapsed(
 }
 
 fn config_level2_order(level2: &str) -> u8 {
-    match level2 {
-        "Source" => 0,
-        "Refresh" => 1,
-        _ => 2,
+    if is_source_group_label(level2) {
+        0
+    } else if is_refresh_group_label(level2) {
+        1
+    } else {
+        2
     }
 }
+
+fn localized_group_order(items: &[ConfigItem]) -> Vec<&str> {
+    let mut order = Vec::new();
+    for english in ["Browser", "GitHub", "GitLab", "DockerHub", "System"] {
+        if let Some(found) = items.iter().find(|item| canonical_group_name(&item.level1) == english) {
+            order.push(found.level1.as_str());
+        }
+    }
+    order
+}
+
+fn canonical_group_name(value: &str) -> &'static str {
+    match value {
+        "Browser" | "浏览器" | "ブラウザー" | "브라우저" | "Navigateur" | "Браузер" => "Browser",
+        "GitHub" => "GitHub",
+        "GitLab" => "GitLab",
+        "DockerHub" => "DockerHub",
+        "System" | "系统" | "システム" | "시스템" | "Systeme" | "Система" => "System",
+        _ => "",
+    }
+}
+
+fn is_auth_group_label(value: &str) -> bool {
+    matches!(value, "Auth" | "认证" | "認証" | "인증" | "Авторизация")
+}
+
+fn is_source_group_label(value: &str) -> bool {
+    matches!(value, "Source" | "来源" | "ソース" | "소스" | "Источник")
+}
+
+fn is_refresh_group_label(value: &str) -> bool {
+    matches!(value, "Refresh" | "刷新" | "更新" | "새로고침" | "Rafraichissement" | "Обновление")
+}
+
 
 fn entry_haystacks(entries: &[Entry]) -> Vec<String> {
     entries.iter().map(Entry::haystack).collect()
@@ -2339,16 +2569,20 @@ struct AppState {
 }
 
 struct ConfigItem {
+    key: ConfigKey,
     level1: String,
     level2: String,
     level3: String,
     current: String,
     haystack: String,
+    configure: String,
+    detail: String,
     edit_kind: ConfigEditKind,
 }
 
 impl ConfigItem {
     fn new(
+        key: ConfigKey,
         level1: impl Into<String>,
         level2: impl Into<String>,
         level3: impl Into<String>,
@@ -2357,6 +2591,7 @@ impl ConfigItem {
         detail: impl Into<String>,
         edit_kind: ConfigEditKind,
     ) -> Self {
+        let key = key;
         let level1 = level1.into();
         let level2 = level2.into();
         let level3 = level3.into();
@@ -2365,21 +2600,49 @@ impl ConfigItem {
         let detail = detail.into();
         let haystack = format!("{level1} {level2} {level3} {current} {configure} {detail}");
         Self {
+            key,
             level1,
             level2,
             level3,
             current,
             haystack,
+            configure,
+            detail,
             edit_kind,
         }
     }
 
     fn refresh_haystack(&mut self) {
         self.haystack = format!(
-            "{} {} {} {}",
-            self.level1, self.level2, self.level3, self.current
+            "{} {} {} {} {} {}",
+            self.level1, self.level2, self.level3, self.current, self.configure, self.detail
         );
     }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ConfigKey {
+    BrowserEnabled,
+    GitHubEnabled,
+    GitLabEnabled,
+    DockerHubEnabled,
+    GitHubToken,
+    GitHubTokenPage,
+    GitHubConnect,
+    GitLabBaseUrl,
+    GitLabTokenPage,
+    GitLabToken,
+    GitLabConnect,
+    DockerHubToken,
+    DockerHubUsername,
+    BrowserRefreshInterval,
+    GitHubRefreshInterval,
+    GitLabRefreshInterval,
+    DockerHubRefreshInterval,
+    SystemPreviewPane,
+    SystemDebugLogging,
+    SystemLanguage,
+    SystemTokenPlan,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -2411,6 +2674,11 @@ enum AppMode {
         buffer: String,
         cursor: usize,
     },
+    ConfigSelect {
+        item_index: usize,
+        options: Vec<LanguageOption>,
+        selected: usize,
+    },
 }
 
 impl AppMode {
@@ -2421,8 +2689,15 @@ impl AppMode {
             AppMode::ActionMenu { .. } => AppModeKind::ActionMenu,
             AppMode::RepoMenu { .. } => AppModeKind::RepoMenu,
             AppMode::ConfigEdit { .. } => AppModeKind::ConfigEdit,
+            AppMode::ConfigSelect { .. } => AppModeKind::ConfigSelect,
         }
     }
+}
+
+#[derive(Clone)]
+struct LanguageOption {
+    code: &'static str,
+    label: &'static str,
 }
 
 impl AppState {
@@ -2955,13 +3230,15 @@ impl AppState {
             item.level3.as_str(),
             item.current.as_str(),
         ) {
-            ("GitHub", "Auth", "Connect", "ok") => Style::default().fg(Color::Green),
-            ("GitHub", "Auth", "Connect", "failed") => Style::default().fg(Color::Red),
-            ("GitHub", "Auth", "Connect", "missing") => Style::default().fg(Color::Yellow),
-            ("GitLab", "Auth", "connect", "ok") => Style::default().fg(Color::Green),
-            ("GitLab", "Auth", "connect", "failed") => Style::default().fg(Color::Red),
-            ("GitLab", "Auth", "connect", "missing") => Style::default().fg(Color::Yellow),
-            _ => Style::default().fg(Color::Cyan),
+            _ => match item.key {
+                ConfigKey::GitHubConnect | ConfigKey::GitLabConnect => match item.current.as_str() {
+                    "ok" => Style::default().fg(Color::Green),
+                    "failed" => Style::default().fg(Color::Red),
+                    "missing" | "testing..." => Style::default().fg(Color::Yellow),
+                    _ => Style::default().fg(Color::Cyan),
+                },
+                _ => Style::default().fg(Color::Cyan),
+            },
         }
     }
 }
@@ -2973,210 +3250,559 @@ fn initial_status_message(config: &Config) -> String {
 }
 
 fn build_config_items(config: &Config) -> Vec<ConfigItem> {
+    let lang = config.language;
     vec![
-        ConfigItem::new(
-            "Browser",
-            "Source",
-            "Enabled",
-            enabled_text(config.include_browser),
-            "--no-browser",
-            "Local browser history and bookmarks. Safari on macOS may require Full Disk Access for the terminal.",
+        config_item(
+            lang,
+            ConfigKey::BrowserEnabled,
+            localized_enabled_text(lang, config.include_browser).to_string(),
+            "--no-browser".to_string(),
+            localized_description(lang, ConfigKey::BrowserEnabled).to_string(),
             ConfigEditKind::Toggle,
         ),
-        ConfigItem::new(
-            "GitHub",
-            "Source",
-            "Enabled",
-            enabled_text(config.include_github),
-            "--no-github",
-            "Search repositories visible to GitHub. Use GITHUB_TOKEN for private or organization repositories, or GITHUB_USER for public user repositories.",
+        config_item(
+            lang,
+            ConfigKey::GitHubEnabled,
+            localized_enabled_text(lang, config.include_github).to_string(),
+            "--no-github".to_string(),
+            localized_description(lang, ConfigKey::GitHubEnabled).to_string(),
             ConfigEditKind::Toggle,
         ),
-        ConfigItem::new(
-            "GitLab",
-            "Source",
-            "Enabled",
-            enabled_text(config.include_gitlab),
-            "--no-gitlab",
-            "Search GitLab projects. Use GITLAB_TOKEN for membership projects; otherwise only public projects are queried.",
+        config_item(
+            lang,
+            ConfigKey::GitLabEnabled,
+            localized_enabled_text(lang, config.include_gitlab).to_string(),
+            "--no-gitlab".to_string(),
+            localized_description(lang, ConfigKey::GitLabEnabled).to_string(),
             ConfigEditKind::Toggle,
         ),
-        ConfigItem::new(
-            "DockerHub",
-            "Source",
-            "Enabled",
-            enabled_text(config.include_dockerhub),
-            "--no-dockerhub",
-            "Search DockerHub repositories for DOCKERHUB_USERNAME. A token enables private repositories.",
+        config_item(
+            lang,
+            ConfigKey::DockerHubEnabled,
+            localized_enabled_text(lang, config.include_dockerhub).to_string(),
+            "--no-dockerhub".to_string(),
+            localized_description(lang, ConfigKey::DockerHubEnabled).to_string(),
             ConfigEditKind::Toggle,
         ),
-        ConfigItem::new(
-            "GitHub",
-            "Auth",
-            "Token",
-            secret_status(config.github_token.as_deref()),
-            "--github-token <token> or GITHUB_TOKEN",
-            "Recommended acquisition: install gh, run gh auth login, then export GITHUB_TOKEN=$(gh auth token). Token needs repository read access for private repos.",
+        config_item(
+            lang,
+            ConfigKey::GitHubToken,
+            localized_secret_status(lang, config.github_token.as_deref()).to_string(),
+            "--github-token <token> or GITHUB_TOKEN".to_string(),
+            localized_description(lang, ConfigKey::GitHubToken).to_string(),
             ConfigEditKind::Secret,
         ),
-        ConfigItem::new(
-            "GitHub",
-            "Auth",
-            "Open token page",
-            "browser",
-            "https://github.com/settings/tokens",
-            "Open GitHub personal access token settings in the browser.",
+        config_item(
+            lang,
+            ConfigKey::GitHubTokenPage,
+            localized_static_value(lang, StaticValue::Browser).to_string(),
+            "https://github.com/settings/tokens".to_string(),
+            localized_description(lang, ConfigKey::GitHubTokenPage).to_string(),
             ConfigEditKind::ReadOnly,
         ),
-        ConfigItem::new(
-            "GitHub",
-            "Auth",
-            "Connect",
-            "not tested",
-            "GitHub connectivity test",
-            "Validate token loading, API reachability, and repository access.",
+        config_item(
+            lang,
+            ConfigKey::GitHubConnect,
+            localized_static_value(lang, StaticValue::NotTested).to_string(),
+            localized_static_value(lang, StaticValue::GithubConnectivityTest).to_string(),
+            localized_description(lang, ConfigKey::GitHubConnect).to_string(),
             ConfigEditKind::ReadOnly,
         ),
-        ConfigItem::new(
-            "GitLab",
-            "Auth",
-            "Base URL",
+        config_item(
+            lang,
+            ConfigKey::GitLabBaseUrl,
             config.gitlab_api.clone(),
-            "--gitlab-api <url> or GITLAB_API",
-            "Set this for self-hosted GitLab. Both https://gitlab.example.com and https://gitlab.example.com/api/v4 are accepted.",
+            "--gitlab-api <url> or GITLAB_API".to_string(),
+            localized_description(lang, ConfigKey::GitLabBaseUrl).to_string(),
             ConfigEditKind::Text,
         ),
-        ConfigItem::new(
-            "GitLab",
-            "Auth",
-            "open token page",
-            "browser",
-            "derived from Base URL",
-            "Open GitLab personal access token settings in the browser.",
+        config_item(
+            lang,
+            ConfigKey::GitLabTokenPage,
+            localized_static_value(lang, StaticValue::Browser).to_string(),
+            localized_static_value(lang, StaticValue::DerivedFromBaseUrl).to_string(),
+            localized_description(lang, ConfigKey::GitLabTokenPage).to_string(),
             ConfigEditKind::ReadOnly,
         ),
-        ConfigItem::new(
-            "GitLab",
-            "Auth",
-            "token",
-            secret_status(config.gitlab_token.as_deref()),
-            "--gitlab-token <token> or GITLAB_TOKEN",
-            "Recommended acquisition when glab is available: glab auth login, then export GITLAB_TOKEN=$(glab auth token). Token should have read_api scope.",
+        config_item(
+            lang,
+            ConfigKey::GitLabToken,
+            localized_secret_status(lang, config.gitlab_token.as_deref()).to_string(),
+            "--gitlab-token <token> or GITLAB_TOKEN".to_string(),
+            localized_description(lang, ConfigKey::GitLabToken).to_string(),
             ConfigEditKind::Secret,
         ),
-        ConfigItem::new(
-            "GitLab",
-            "Auth",
-            "connect",
-            "not tested",
-            "GitLab connectivity test",
-            "Validate base URL, token loading, API reachability, and project access.",
+        config_item(
+            lang,
+            ConfigKey::GitLabConnect,
+            localized_static_value(lang, StaticValue::NotTested).to_string(),
+            localized_static_value(lang, StaticValue::GitlabConnectivityTest).to_string(),
+            localized_description(lang, ConfigKey::GitLabConnect).to_string(),
             ConfigEditKind::ReadOnly,
         ),
-        ConfigItem::new(
-            "DockerHub",
-            "Auth",
-            "Token",
-            secret_status(config.dockerhub_token.as_deref()),
-            "--dockerhub-token <token> or DOCKERHUB_TOKEN",
-            "Create a DockerHub Personal Access Token and export DOCKERHUB_TOKEN. Future automatic flow can read docker login credentials or request a PAT interactively.",
+        config_item(
+            lang,
+            ConfigKey::DockerHubToken,
+            localized_secret_status(lang, config.dockerhub_token.as_deref()).to_string(),
+            "--dockerhub-token <token> or DOCKERHUB_TOKEN".to_string(),
+            localized_description(lang, ConfigKey::DockerHubToken).to_string(),
             ConfigEditKind::Secret,
         ),
-        ConfigItem::new(
-            "DockerHub",
-            "Auth",
-            "Username",
-            optional_value(config.dockerhub_username.as_deref()),
-            "--dockerhub-user <user> or DOCKERHUB_USERNAME",
-            "Required for DockerHub repository search.",
+        config_item(
+            lang,
+            ConfigKey::DockerHubUsername,
+            localized_optional_value(lang, config.dockerhub_username.as_deref()),
+            "--dockerhub-user <user> or DOCKERHUB_USERNAME".to_string(),
+            localized_description(lang, ConfigKey::DockerHubUsername).to_string(),
             ConfigEditKind::Text,
         ),
-        ConfigItem::new(
-            "Browser",
-            "Refresh",
-            "Interval",
+        config_item(
+            lang,
+            ConfigKey::BrowserRefreshInterval,
             format_duration(config.history_refresh_interval),
-            "WEB_FZF_HISTORY_REFRESH",
-            "Seconds only. Use plain seconds such as 60, or add s such as 5s.",
+            "WEB_FZF_HISTORY_REFRESH".to_string(),
+            localized_description(lang, ConfigKey::BrowserRefreshInterval).to_string(),
             ConfigEditKind::Text,
         ),
-        ConfigItem::new(
-            "GitHub",
-            "Refresh",
-            "Interval",
+        config_item(
+            lang,
+            ConfigKey::GitHubRefreshInterval,
             format_duration(config.github_refresh_interval),
-            "WEB_FZF_GITHUB_REFRESH",
-            "Seconds only. Remote cache is used immediately; refresh runs in the background after this many seconds.",
+            "WEB_FZF_GITHUB_REFRESH".to_string(),
+            localized_description(lang, ConfigKey::GitHubRefreshInterval).to_string(),
             ConfigEditKind::Text,
         ),
-        ConfigItem::new(
-            "GitLab",
-            "Refresh",
-            "Interval",
+        config_item(
+            lang,
+            ConfigKey::GitLabRefreshInterval,
             format_duration(config.gitlab_refresh_interval),
-            "WEB_FZF_GITLAB_REFRESH",
-            "Seconds only. Previous cache is kept if refresh fails or returns no rows.",
+            "WEB_FZF_GITLAB_REFRESH".to_string(),
+            localized_description(lang, ConfigKey::GitLabRefreshInterval).to_string(),
             ConfigEditKind::Text,
         ),
-        ConfigItem::new(
-            "DockerHub",
-            "Refresh",
-            "Interval",
+        config_item(
+            lang,
+            ConfigKey::DockerHubRefreshInterval,
             format_duration(config.dockerhub_refresh_interval),
-            "WEB_FZF_DOCKERHUB_REFRESH",
-            "Seconds only. Controls DockerHub repository cache refresh frequency.",
+            "WEB_FZF_DOCKERHUB_REFRESH".to_string(),
+            localized_description(lang, ConfigKey::DockerHubRefreshInterval).to_string(),
             ConfigEditKind::Text,
         ),
-        ConfigItem::new(
-            "System",
-            "Display",
-            "Preview pane",
-            enabled_text(config.preview_enabled),
-            "WEB_FZF_PREVIEW or config file",
-            "Enables the preview pane in normal result views.",
+        config_item(
+            lang,
+            ConfigKey::SystemPreviewPane,
+            localized_enabled_text(lang, config.preview_enabled).to_string(),
+            "WEB_FZF_PREVIEW or config file".to_string(),
+            localized_description(lang, ConfigKey::SystemPreviewPane).to_string(),
             ConfigEditKind::Toggle,
         ),
-        ConfigItem::new(
-            "System",
-            "Diagnostics",
-            "Debug logging",
-            enabled_text(config.debug),
-            "--debug",
-            "Writes diagnostics to stderr. Redirect stderr to a file so it does not interfere with the TUI.",
+        config_item(
+            lang,
+            ConfigKey::SystemDebugLogging,
+            localized_enabled_text(lang, config.debug).to_string(),
+            "--debug".to_string(),
+            localized_description(lang, ConfigKey::SystemDebugLogging).to_string(),
             ConfigEditKind::Toggle,
         ),
-        ConfigItem::new(
-            "System",
-            "Automation",
-            "Token plan",
-            "planned",
-            "Config tab action menu",
-            "GitHub can shell out to gh auth token, GitLab can shell out to glab auth token, and DockerHub can import existing docker login credentials or guide PAT creation. Tokens should be shown as present/missing only.",
+        config_item(
+            lang,
+            ConfigKey::SystemLanguage,
+            localized_language_name(lang, config.language).to_string(),
+            "en | zh | ja | ko | fr | ru".to_string(),
+            localized_description(lang, ConfigKey::SystemLanguage).to_string(),
+            ConfigEditKind::Text,
+        ),
+        config_item(
+            lang,
+            ConfigKey::SystemTokenPlan,
+            localized_static_value(lang, StaticValue::Planned).to_string(),
+            localized_static_value(lang, StaticValue::ConfigTabActionMenu).to_string(),
+            localized_description(lang, ConfigKey::SystemTokenPlan).to_string(),
             ConfigEditKind::ReadOnly,
         ),
     ]
 }
 
-fn enabled_text(value: bool) -> &'static str {
-    if value {
-        "enabled"
-    } else {
-        "disabled"
+fn config_item(
+    lang: Language,
+    key: ConfigKey,
+    current: String,
+    configure: String,
+    detail: String,
+    edit_kind: ConfigEditKind,
+) -> ConfigItem {
+    let (level1, level2, level3) = localized_config_path(lang, key);
+    ConfigItem::new(key, level1, level2, level3, current, configure, detail, edit_kind)
+}
+
+#[derive(Clone, Copy)]
+enum StaticValue {
+    Browser,
+    NotTested,
+    Planned,
+    DerivedFromBaseUrl,
+    GithubConnectivityTest,
+    GitlabConnectivityTest,
+    ConfigTabActionMenu,
+}
+
+fn localized_config_path(lang: Language, key: ConfigKey) -> (String, String, String) {
+    let path = match key {
+        ConfigKey::BrowserEnabled => ("Browser", "Source", "Enabled"),
+        ConfigKey::GitHubEnabled => ("GitHub", "Source", "Enabled"),
+        ConfigKey::GitLabEnabled => ("GitLab", "Source", "Enabled"),
+        ConfigKey::DockerHubEnabled => ("DockerHub", "Source", "Enabled"),
+        ConfigKey::GitHubToken => ("GitHub", "Auth", "Token"),
+        ConfigKey::GitHubTokenPage => ("GitHub", "Auth", "Open token page"),
+        ConfigKey::GitHubConnect => ("GitHub", "Auth", "Connect"),
+        ConfigKey::GitLabBaseUrl => ("GitLab", "Auth", "Base URL"),
+        ConfigKey::GitLabTokenPage => ("GitLab", "Auth", "Open token page"),
+        ConfigKey::GitLabToken => ("GitLab", "Auth", "Token"),
+        ConfigKey::GitLabConnect => ("GitLab", "Auth", "Connect"),
+        ConfigKey::DockerHubToken => ("DockerHub", "Auth", "Token"),
+        ConfigKey::DockerHubUsername => ("DockerHub", "Auth", "Username"),
+        ConfigKey::BrowserRefreshInterval => ("Browser", "Refresh", "Interval"),
+        ConfigKey::GitHubRefreshInterval => ("GitHub", "Refresh", "Interval"),
+        ConfigKey::GitLabRefreshInterval => ("GitLab", "Refresh", "Interval"),
+        ConfigKey::DockerHubRefreshInterval => ("DockerHub", "Refresh", "Interval"),
+        ConfigKey::SystemPreviewPane => ("System", "Display", "Preview pane"),
+        ConfigKey::SystemDebugLogging => ("System", "Diagnostics", "Debug logging"),
+        ConfigKey::SystemLanguage => ("System", "Display", "Language"),
+        ConfigKey::SystemTokenPlan => ("System", "Automation", "Token plan"),
+    };
+    (
+        localize_label(lang, path.0),
+        localize_label(lang, path.1),
+        localize_label(lang, path.2),
+    )
+}
+
+fn localize_label(lang: Language, text: &str) -> String {
+    match (lang, text) {
+        (Language::Chinese, "Browser") => "浏览器".to_string(),
+        (Language::Chinese, "Source") => "来源".to_string(),
+        (Language::Chinese, "Enabled") => "启用".to_string(),
+        (Language::Chinese, "Auth") => "认证".to_string(),
+        (Language::Chinese, "Token") => "令牌".to_string(),
+        (Language::Chinese, "Open token page") => "打开令牌页面".to_string(),
+        (Language::Chinese, "Connect") => "连接测试".to_string(),
+        (Language::Chinese, "Base URL") => "基础地址".to_string(),
+        (Language::Chinese, "Username") => "用户名".to_string(),
+        (Language::Chinese, "Refresh") => "刷新".to_string(),
+        (Language::Chinese, "Interval") => "间隔".to_string(),
+        (Language::Chinese, "System") => "系统".to_string(),
+        (Language::Chinese, "Display") => "显示".to_string(),
+        (Language::Chinese, "Preview pane") => "预览面板".to_string(),
+        (Language::Chinese, "Diagnostics") => "诊断".to_string(),
+        (Language::Chinese, "Debug logging") => "调试日志".to_string(),
+        (Language::Chinese, "Language") => "语言".to_string(),
+        (Language::Chinese, "Automation") => "自动化".to_string(),
+        (Language::Chinese, "Token plan") => "令牌计划".to_string(),
+        (Language::Japanese, "Browser") => "ブラウザー".to_string(),
+        (Language::Japanese, "Source") => "ソース".to_string(),
+        (Language::Japanese, "Enabled") => "有効".to_string(),
+        (Language::Japanese, "Auth") => "認証".to_string(),
+        (Language::Japanese, "Token") => "トークン".to_string(),
+        (Language::Japanese, "Open token page") => "トークンページを開く".to_string(),
+        (Language::Japanese, "Connect") => "接続確認".to_string(),
+        (Language::Japanese, "Base URL") => "ベースURL".to_string(),
+        (Language::Japanese, "Username") => "ユーザー名".to_string(),
+        (Language::Japanese, "Refresh") => "更新".to_string(),
+        (Language::Japanese, "Interval") => "間隔".to_string(),
+        (Language::Japanese, "System") => "システム".to_string(),
+        (Language::Japanese, "Display") => "表示".to_string(),
+        (Language::Japanese, "Preview pane") => "プレビュー".to_string(),
+        (Language::Japanese, "Diagnostics") => "診断".to_string(),
+        (Language::Japanese, "Debug logging") => "デバッグログ".to_string(),
+        (Language::Japanese, "Language") => "言語".to_string(),
+        (Language::Japanese, "Automation") => "自動化".to_string(),
+        (Language::Japanese, "Token plan") => "トークンプラン".to_string(),
+        (Language::Korean, "Browser") => "브라우저".to_string(),
+        (Language::Korean, "Source") => "소스".to_string(),
+        (Language::Korean, "Enabled") => "사용".to_string(),
+        (Language::Korean, "Auth") => "인증".to_string(),
+        (Language::Korean, "Token") => "토큰".to_string(),
+        (Language::Korean, "Open token page") => "토큰 페이지 열기".to_string(),
+        (Language::Korean, "Connect") => "연결 확인".to_string(),
+        (Language::Korean, "Base URL") => "기본 URL".to_string(),
+        (Language::Korean, "Username") => "사용자명".to_string(),
+        (Language::Korean, "Refresh") => "새로고침".to_string(),
+        (Language::Korean, "Interval") => "간격".to_string(),
+        (Language::Korean, "System") => "시스템".to_string(),
+        (Language::Korean, "Display") => "표시".to_string(),
+        (Language::Korean, "Preview pane") => "미리보기".to_string(),
+        (Language::Korean, "Diagnostics") => "진단".to_string(),
+        (Language::Korean, "Debug logging") => "디버그 로그".to_string(),
+        (Language::Korean, "Language") => "언어".to_string(),
+        (Language::Korean, "Automation") => "자동화".to_string(),
+        (Language::Korean, "Token plan") => "토큰 계획".to_string(),
+        (Language::French, "Browser") => "Navigateur".to_string(),
+        (Language::French, "Source") => "Source".to_string(),
+        (Language::French, "Enabled") => "Active".to_string(),
+        (Language::French, "Auth") => "Auth".to_string(),
+        (Language::French, "Token") => "Jeton".to_string(),
+        (Language::French, "Open token page") => "Ouvrir la page du jeton".to_string(),
+        (Language::French, "Connect") => "Connexion".to_string(),
+        (Language::French, "Base URL") => "URL de base".to_string(),
+        (Language::French, "Username") => "Nom d'utilisateur".to_string(),
+        (Language::French, "Refresh") => "Rafraichissement".to_string(),
+        (Language::French, "Interval") => "Intervalle".to_string(),
+        (Language::French, "System") => "Systeme".to_string(),
+        (Language::French, "Display") => "Affichage".to_string(),
+        (Language::French, "Preview pane") => "Volet d'aperçu".to_string(),
+        (Language::French, "Diagnostics") => "Diagnostic".to_string(),
+        (Language::French, "Debug logging") => "Journal de debug".to_string(),
+        (Language::French, "Language") => "Langue".to_string(),
+        (Language::French, "Automation") => "Automatisation".to_string(),
+        (Language::French, "Token plan") => "Plan des jetons".to_string(),
+        (Language::Russian, "Browser") => "Браузер".to_string(),
+        (Language::Russian, "Source") => "Источник".to_string(),
+        (Language::Russian, "Enabled") => "Включено".to_string(),
+        (Language::Russian, "Auth") => "Авторизация".to_string(),
+        (Language::Russian, "Token") => "Токен".to_string(),
+        (Language::Russian, "Open token page") => "Открыть страницу токена".to_string(),
+        (Language::Russian, "Connect") => "Проверка связи".to_string(),
+        (Language::Russian, "Base URL") => "Базовый URL".to_string(),
+        (Language::Russian, "Username") => "Имя пользователя".to_string(),
+        (Language::Russian, "Refresh") => "Обновление".to_string(),
+        (Language::Russian, "Interval") => "Интервал".to_string(),
+        (Language::Russian, "System") => "Система".to_string(),
+        (Language::Russian, "Display") => "Отображение".to_string(),
+        (Language::Russian, "Preview pane") => "Панель предпросмотра".to_string(),
+        (Language::Russian, "Diagnostics") => "Диагностика".to_string(),
+        (Language::Russian, "Debug logging") => "Журнал отладки".to_string(),
+        (Language::Russian, "Language") => "Язык".to_string(),
+        (Language::Russian, "Automation") => "Автоматизация".to_string(),
+        (Language::Russian, "Token plan") => "План токенов".to_string(),
+        _ => text.to_string(),
     }
 }
 
-fn secret_status(value: Option<&str>) -> &'static str {
-    match value {
-        Some(value) if !value.is_empty() => "present",
-        _ => "missing",
+fn localized_enabled_text(lang: Language, value: bool) -> &'static str {
+    match (lang, value) {
+        (Language::Chinese, true) => "已启用",
+        (Language::Chinese, false) => "已禁用",
+        (Language::Japanese, true) => "有効",
+        (Language::Japanese, false) => "無効",
+        (Language::Korean, true) => "사용",
+        (Language::Korean, false) => "사용 안 함",
+        (Language::French, true) => "active",
+        (Language::French, false) => "desactive",
+        (Language::Russian, true) => "включено",
+        (Language::Russian, false) => "выключено",
+        (_, true) => "enabled",
+        (_, false) => "disabled",
     }
 }
 
-fn optional_value(value: Option<&str>) -> String {
+fn localized_secret_status(lang: Language, value: Option<&str>) -> &'static str {
+    let present = value.is_some_and(|value| !value.is_empty());
+    match (lang, present) {
+        (Language::Chinese, true) => "已提供",
+        (Language::Chinese, false) => "缺失",
+        (Language::Japanese, true) => "設定済み",
+        (Language::Japanese, false) => "未設定",
+        (Language::Korean, true) => "설정됨",
+        (Language::Korean, false) => "없음",
+        (Language::French, true) => "present",
+        (Language::French, false) => "absent",
+        (Language::Russian, true) => "есть",
+        (Language::Russian, false) => "нет",
+        (_, true) => "present",
+        (_, false) => "missing",
+    }
+}
+
+fn localized_optional_value(lang: Language, value: Option<&str>) -> String {
     value
         .filter(|value| !value.is_empty())
-        .unwrap_or("not set")
+        .unwrap_or(match lang {
+            Language::Chinese => "未设置",
+            Language::Japanese => "未設定",
+            Language::Korean => "설정 안 됨",
+            Language::French => "non defini",
+            Language::Russian => "не задано",
+            Language::English => "not set",
+        })
         .to_string()
+}
+
+fn localized_language_name(lang: Language, value: Language) -> &'static str {
+    match (lang, value) {
+        (Language::Chinese, Language::English) => "英语",
+        (Language::Chinese, Language::Chinese) => "中文",
+        (Language::Chinese, Language::Japanese) => "日语",
+        (Language::Chinese, Language::Korean) => "韩语",
+        (Language::Chinese, Language::French) => "法语",
+        (Language::Chinese, Language::Russian) => "俄语",
+        (Language::Japanese, Language::English) => "英語",
+        (Language::Japanese, Language::Chinese) => "中国語",
+        (Language::Japanese, Language::Japanese) => "日本語",
+        (Language::Japanese, Language::Korean) => "韓国語",
+        (Language::Japanese, Language::French) => "フランス語",
+        (Language::Japanese, Language::Russian) => "ロシア語",
+        (Language::Korean, Language::English) => "영어",
+        (Language::Korean, Language::Chinese) => "중국어",
+        (Language::Korean, Language::Japanese) => "일본어",
+        (Language::Korean, Language::Korean) => "한국어",
+        (Language::Korean, Language::French) => "프랑스어",
+        (Language::Korean, Language::Russian) => "러시아어",
+        (Language::French, Language::English) => "anglais",
+        (Language::French, Language::Chinese) => "chinois",
+        (Language::French, Language::Japanese) => "japonais",
+        (Language::French, Language::Korean) => "coreen",
+        (Language::French, Language::French) => "francais",
+        (Language::French, Language::Russian) => "russe",
+        (Language::Russian, Language::English) => "английский",
+        (Language::Russian, Language::Chinese) => "китайский",
+        (Language::Russian, Language::Japanese) => "японский",
+        (Language::Russian, Language::Korean) => "корейский",
+        (Language::Russian, Language::French) => "французский",
+        (Language::Russian, Language::Russian) => "русский",
+        (_, Language::English) => "English",
+        (_, Language::Chinese) => "Chinese",
+        (_, Language::Japanese) => "Japanese",
+        (_, Language::Korean) => "Korean",
+        (_, Language::French) => "French",
+        (_, Language::Russian) => "Russian",
+    }
+}
+
+fn language_options(lang: Language) -> Vec<LanguageOption> {
+    let _ = lang;
+    vec![
+        LanguageOption {
+            code: "en",
+            label: "English",
+        },
+        LanguageOption {
+            code: "zh",
+            label: "中文",
+        },
+        LanguageOption {
+            code: "ja",
+            label: "日本語",
+        },
+        LanguageOption {
+            code: "ko",
+            label: "한국어",
+        },
+        LanguageOption {
+            code: "fr",
+            label: "Francais",
+        },
+        LanguageOption {
+            code: "ru",
+            label: "Русский",
+        },
+    ]
+}
+
+fn language_option_index(language: Language) -> usize {
+    match language {
+        Language::English => 0,
+        Language::Chinese => 1,
+        Language::Japanese => 2,
+        Language::Korean => 3,
+        Language::French => 4,
+        Language::Russian => 5,
+    }
+}
+
+fn localized_static_value(lang: Language, value: StaticValue) -> &'static str {
+    match (lang, value) {
+        (Language::Chinese, StaticValue::Browser) => "浏览器",
+        (Language::Chinese, StaticValue::NotTested) => "未测试",
+        (Language::Chinese, StaticValue::Planned) => "计划中",
+        (Language::Chinese, StaticValue::DerivedFromBaseUrl) => "由基础地址推导",
+        (Language::Chinese, StaticValue::GithubConnectivityTest) => "GitHub 连接测试",
+        (Language::Chinese, StaticValue::GitlabConnectivityTest) => "GitLab 连接测试",
+        (Language::Chinese, StaticValue::ConfigTabActionMenu) => "Config 标签动作菜单",
+        (Language::Japanese, StaticValue::Browser) => "ブラウザー",
+        (Language::Japanese, StaticValue::NotTested) => "未確認",
+        (Language::Japanese, StaticValue::Planned) => "予定",
+        (Language::Japanese, StaticValue::DerivedFromBaseUrl) => "ベースURLから決定",
+        (Language::Japanese, StaticValue::GithubConnectivityTest) => "GitHub 接続確認",
+        (Language::Japanese, StaticValue::GitlabConnectivityTest) => "GitLab 接続確認",
+        (Language::Japanese, StaticValue::ConfigTabActionMenu) => "Config タブのアクションメニュー",
+        (Language::Korean, StaticValue::Browser) => "브라우저",
+        (Language::Korean, StaticValue::NotTested) => "미확인",
+        (Language::Korean, StaticValue::Planned) => "예정",
+        (Language::Korean, StaticValue::DerivedFromBaseUrl) => "기본 URL 기준",
+        (Language::Korean, StaticValue::GithubConnectivityTest) => "GitHub 연결 테스트",
+        (Language::Korean, StaticValue::GitlabConnectivityTest) => "GitLab 연결 테스트",
+        (Language::Korean, StaticValue::ConfigTabActionMenu) => "Config 탭 액션 메뉴",
+        (Language::French, StaticValue::Browser) => "navigateur",
+        (Language::French, StaticValue::NotTested) => "non teste",
+        (Language::French, StaticValue::Planned) => "prevu",
+        (Language::French, StaticValue::DerivedFromBaseUrl) => "derive de l'URL de base",
+        (Language::French, StaticValue::GithubConnectivityTest) => "test GitHub",
+        (Language::French, StaticValue::GitlabConnectivityTest) => "test GitLab",
+        (Language::French, StaticValue::ConfigTabActionMenu) => "menu d'action Config",
+        (Language::Russian, StaticValue::Browser) => "браузер",
+        (Language::Russian, StaticValue::NotTested) => "не проверено",
+        (Language::Russian, StaticValue::Planned) => "запланировано",
+        (Language::Russian, StaticValue::DerivedFromBaseUrl) => "зависит от Base URL",
+        (Language::Russian, StaticValue::GithubConnectivityTest) => "проверка GitHub",
+        (Language::Russian, StaticValue::GitlabConnectivityTest) => "проверка GitLab",
+        (Language::Russian, StaticValue::ConfigTabActionMenu) => "меню действий Config",
+        (_, StaticValue::Browser) => "browser",
+        (_, StaticValue::NotTested) => "not tested",
+        (_, StaticValue::Planned) => "planned",
+        (_, StaticValue::DerivedFromBaseUrl) => "derived from Base URL",
+        (_, StaticValue::GithubConnectivityTest) => "GitHub connectivity test",
+        (_, StaticValue::GitlabConnectivityTest) => "GitLab connectivity test",
+        (_, StaticValue::ConfigTabActionMenu) => "Config tab action menu",
+    }
+}
+
+fn localized_description(lang: Language, key: ConfigKey) -> &'static str {
+    match (lang, key) {
+        (Language::Chinese, ConfigKey::BrowserEnabled) => "本地浏览器历史和书签。macOS 上的 Safari 可能需要为终端授予完全磁盘访问权限。",
+        (Language::Chinese, ConfigKey::GitHubEnabled) => "搜索 GitHub 可见仓库。私有或组织仓库请使用 GITHUB_TOKEN，公开用户仓库可使用 GITHUB_USER。",
+        (Language::Chinese, ConfigKey::GitLabEnabled) => "搜索 GitLab 项目。成员项目使用 GITLAB_TOKEN，否则只查询公开项目。",
+        (Language::Chinese, ConfigKey::DockerHubEnabled) => "搜索 DOCKERHUB_USERNAME 名下的 DockerHub 仓库。令牌可启用私有仓库。",
+        (Language::Chinese, ConfigKey::GitHubToken) => "建议安装 gh，执行 gh auth login，然后导出 GITHUB_TOKEN=$(gh auth token)。私有仓库需要读取权限。",
+        (Language::Chinese, ConfigKey::GitHubTokenPage) => "在浏览器中打开 GitHub 个人访问令牌设置。",
+        (Language::Chinese, ConfigKey::GitHubConnect) => "验证令牌加载、API 可达性和仓库访问。",
+        (Language::Chinese, ConfigKey::GitLabBaseUrl) => "自建 GitLab 在这里设置。接受 https://gitlab.example.com 和 https://gitlab.example.com/api/v4 两种格式。",
+        (Language::Chinese, ConfigKey::GitLabTokenPage) => "在浏览器中打开 GitLab 个人访问令牌设置。",
+        (Language::Chinese, ConfigKey::GitLabToken) => "如安装 glab，建议执行 glab auth login，然后导出 GITLAB_TOKEN=$(glab auth token)。令牌需要 read_api 权限。",
+        (Language::Chinese, ConfigKey::GitLabConnect) => "验证基础地址、令牌加载、API 可达性和项目访问。",
+        (Language::Chinese, ConfigKey::DockerHubToken) => "创建 DockerHub Personal Access Token 并导出 DOCKERHUB_TOKEN。后续可支持读取 docker 登录凭据或交互式引导 PAT。",
+        (Language::Chinese, ConfigKey::DockerHubUsername) => "DockerHub 仓库搜索必填。",
+        (Language::Chinese, ConfigKey::BrowserRefreshInterval) => "仅支持秒。可用 60 或 5s。",
+        (Language::Chinese, ConfigKey::GitHubRefreshInterval) => "仅支持秒。先立即使用本地缓存，再按此间隔后台刷新。",
+        (Language::Chinese, ConfigKey::GitLabRefreshInterval) => "仅支持秒。刷新失败或返回空结果时保留旧缓存。",
+        (Language::Chinese, ConfigKey::DockerHubRefreshInterval) => "仅支持秒。控制 DockerHub 仓库缓存刷新频率。",
+        (Language::Chinese, ConfigKey::SystemPreviewPane) => "在普通结果视图中启用预览面板。",
+        (Language::Chinese, ConfigKey::SystemDebugLogging) => "把诊断日志写到 stderr。建议重定向到文件以免干扰 TUI。",
+        (Language::Chinese, ConfigKey::SystemLanguage) => "设置 Config 标签页的显示语言。支持中日韩和英法俄。",
+        (Language::Chinese, ConfigKey::SystemTokenPlan) => "GitHub 可调用 gh auth token，GitLab 可调用 glab auth token，DockerHub 可导入现有 docker 登录凭据或引导创建 PAT。界面只显示是否存在，不显示原始令牌。",
+        _ => match key {
+            ConfigKey::BrowserEnabled => "Local browser history and bookmarks. Safari on macOS may require Full Disk Access for the terminal.",
+            ConfigKey::GitHubEnabled => "Search repositories visible to GitHub. Use GITHUB_TOKEN for private or organization repositories, or GITHUB_USER for public user repositories.",
+            ConfigKey::GitLabEnabled => "Search GitLab projects. Use GITLAB_TOKEN for membership projects; otherwise only public projects are queried.",
+            ConfigKey::DockerHubEnabled => "Search DockerHub repositories for DOCKERHUB_USERNAME. A token enables private repositories.",
+            ConfigKey::GitHubToken => "Recommended acquisition: install gh, run gh auth login, then export GITHUB_TOKEN=$(gh auth token). Token needs repository read access for private repos.",
+            ConfigKey::GitHubTokenPage => "Open GitHub personal access token settings in the browser.",
+            ConfigKey::GitHubConnect => "Validate token loading, API reachability, and repository access.",
+            ConfigKey::GitLabBaseUrl => "Set this for self-hosted GitLab. Both https://gitlab.example.com and https://gitlab.example.com/api/v4 are accepted.",
+            ConfigKey::GitLabTokenPage => "Open GitLab personal access token settings in the browser.",
+            ConfigKey::GitLabToken => "Recommended acquisition when glab is available: glab auth login, then export GITLAB_TOKEN=$(glab auth token). Token should have read_api scope.",
+            ConfigKey::GitLabConnect => "Validate base URL, token loading, API reachability, and project access.",
+            ConfigKey::DockerHubToken => "Create a DockerHub Personal Access Token and export DOCKERHUB_TOKEN. Future automatic flow can read docker login credentials or request a PAT interactively.",
+            ConfigKey::DockerHubUsername => "Required for DockerHub repository search.",
+            ConfigKey::BrowserRefreshInterval => "Seconds only. Use plain seconds such as 60, or add s such as 5s.",
+            ConfigKey::GitHubRefreshInterval => "Seconds only. Remote cache is used immediately; refresh runs in the background after this many seconds.",
+            ConfigKey::GitLabRefreshInterval => "Seconds only. Previous cache is kept if refresh fails or returns no rows.",
+            ConfigKey::DockerHubRefreshInterval => "Seconds only. Controls DockerHub repository cache refresh frequency.",
+            ConfigKey::SystemPreviewPane => "Enables the preview pane in normal result views.",
+            ConfigKey::SystemDebugLogging => "Writes diagnostics to stderr. Redirect stderr to a file so it does not interfere with the TUI.",
+            ConfigKey::SystemLanguage => "Sets the display language for the Config tab. Supports Chinese, Japanese, Korean, English, French, and Russian.",
+            ConfigKey::SystemTokenPlan => "GitHub can shell out to gh auth token, GitLab can shell out to glab auth token, and DockerHub can import existing docker login credentials or guide PAT creation. Tokens should be shown as present/missing only.",
+        },
+    }
 }
 
 fn config_gitlab_web_base(config: &Config) -> String {
@@ -3241,13 +3867,13 @@ impl Drop for TerminalSession {
 #[cfg(test)]
 mod tests {
     use super::{
-        apply_action, best_entry, commit_config_edit, config_display_rows, display_width,
-        entry_haystacks, open_selected_entry, parse_next_input_key, rank_entries,
-        ranked_config_items, resolve_action, start_config_edit, tab_count, Action, AppMode,
-        AppModeKind, AppState, ConfigDisplayRow, HistorySort, InputCode, InputKey, RefreshRequest,
-        Tab, UiEvent,
+        apply_action, best_entry, commit_config_edit, commit_config_select, config_display_rows,
+        display_width, entry_haystacks, move_selection_down, open_selected_entry,
+        parse_next_input_key, rank_entries, ranked_config_items, resolve_action,
+        start_config_edit, tab_count, Action, AppMode, AppModeKind, AppState, ConfigDisplayRow,
+        ConfigKey, HistorySort, InputCode, InputKey, RefreshRequest, Tab, UiEvent,
     };
-    use crate::config::{Config, RuntimeConfig};
+    use crate::config::{Config, Language, RuntimeConfig};
     use crate::models::Entry;
     use std::sync::mpsc;
     use std::sync::{Arc, Mutex};
@@ -3727,7 +4353,7 @@ mod tests {
 
         assert_eq!(
             gitlab_auth,
-            vec!["Base URL", "open token page", "token", "connect"]
+            vec!["Base URL", "Open token page", "Token", "Connect"]
         );
     }
 
@@ -3960,6 +4586,68 @@ mod tests {
         assert_eq!(app.config.github_token.as_deref(), Some("new"));
         let item = &app.config_items[app.selected_config_item_index().unwrap()];
         assert_eq!(item.current, "present");
+    }
+
+    #[test]
+    fn language_setting_opens_selection_popup() {
+        let mut app = app_state(Vec::new());
+        app.tab = Tab::Config;
+        app.query = "language".to_string();
+        app.recompute();
+        let rows = config_display_rows(&app.config_items, &app.query);
+        app.selected = rows
+            .iter()
+            .position(|row| match row {
+                ConfigDisplayRow::Item(idx) => app.config_items[*idx].key == ConfigKey::SystemLanguage,
+                ConfigDisplayRow::Group(_) | ConfigDisplayRow::Subgroup(_) => false,
+            })
+            .unwrap();
+
+        start_config_edit(&mut app);
+
+        match app.mode {
+            AppMode::ConfigSelect {
+                ref options,
+                selected,
+                ..
+            } => {
+                assert_eq!(selected, 0);
+                assert_eq!(options.len(), 6);
+                assert_eq!(options[1].code, "zh");
+                assert_eq!(options[0].label, "English");
+                assert_eq!(options[1].label, "中文");
+                assert_eq!(options[2].label, "日本語");
+            }
+            _ => panic!("expected language selection popup"),
+        }
+    }
+
+    #[test]
+    fn language_selection_saves_without_typing() {
+        let mut app = app_state(Vec::new());
+        app.tab = Tab::Config;
+        app.query = "language".to_string();
+        app.recompute();
+        let rows = config_display_rows(&app.config_items, &app.query);
+        app.selected = rows
+            .iter()
+            .position(|row| match row {
+                ConfigDisplayRow::Item(idx) => app.config_items[*idx].key == ConfigKey::SystemLanguage,
+                ConfigDisplayRow::Group(_) | ConfigDisplayRow::Subgroup(_) => false,
+            })
+            .unwrap();
+
+        start_config_edit(&mut app);
+        move_selection_down(&mut app);
+        commit_config_select(&mut app);
+
+        assert_eq!(app.config.language, Language::Chinese);
+        let item = app
+            .config_items
+            .iter()
+            .find(|item| item.key == ConfigKey::SystemLanguage)
+            .unwrap();
+        assert_eq!(item.current, "中文");
     }
 
     #[test]
